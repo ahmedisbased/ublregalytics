@@ -47,14 +47,12 @@ const Login = () => {
         e.preventDefault();
         const isEmailValid = validateField('email', email);
         const isPasswordValid = validateField('password', password);
-
         if (isEmailValid && isPasswordValid) {
-
             try {
                 setIsSubmitting(true);
                 const trimmedEmail = email.trim();
                 const response = await loginUser({ email: trimmedEmail, password });
-
+                
                 if (response.success && response.role) {
                     const normalizedRole: UserRole = response.role === 'ADMIN' ? 'superAdmin' : 'standard';
                     const userName = extractUserName(trimmedEmail);
