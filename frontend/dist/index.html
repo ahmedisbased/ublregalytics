@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="no-referrer" />
+    <!--
+      Defence-in-depth CSP. The authoritative security headers (incl.
+      frame-ancestors / X-Frame-Options, which browsers IGNORE in a <meta>)
+      MUST be set by the web server / reverse proxy - see nginx.conf.sample
+      and staticwebapp.config.json. This meta restricts what the page itself
+      can load if those headers are ever missing.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' http://127.0.0.1:8000; object-src 'none'; base-uri 'self'"
+    />
+    <title>UBL-Regalytics</title>
+    <script type="module" crossorigin src="/assets/index-Cv3CFqi1.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Cgr264pt.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

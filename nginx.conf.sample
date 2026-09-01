@@ -1,0 +1,73 @@
+# =============================================================================
+# Hardened nginx reverse proxy for Regalytics (sample)
+# =============================================================================
+# Addresses finding 5.7 "Obsolete Ciphers" and reinforces 5.5 / 5.6
+# (clickjacking + missing security headers) at the network edge.
+#
+# Finding 5.7 is NOT an application bug - it is a TLS configuration issue on
+# whatever terminates HTTPS (nginx / IIS / load balancer). The block below
+# disables SSLv3/TLS1.0/TLS1.1 and all weak/CBC/RC4/3DES ciphers, leaving only
+# modern AEAD suites (AES-GCM / ChaCha20) over TLS 1.2 and 1.3.
+#
+# Adjust paths, server_name, and upstream addresses for your environment, then:
+#   nginx -t && systemctl reload nginx
+# Verify afterwards with: testssl.sh https://regalyticshub.ubl.com.pk
+# =============================================================================
+
+# Frontend (static dist/) + API reverse proxy on one host.
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name regalyticshub.ubl.com.pk;
+
+    # --- Certificates -------------------------------------------------------
+    ssl_certificate     /etc/ssl/regalytics/fullchain.pem;
+    ssl_certificate_key /etc/ssl/regalytics/privkey.pem;
+
+    # --- TLS hardening (fixes "Obsolete Ciphers") ---------------------------
+    # Only TLS 1.2 and 1.3. Drop SSLv2/SSLv3/TLS1.0/TLS1.1 entirely.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    # Modern, forward-secret AEAD suites only. No CBC, no RC4, no 3DES, no
+    # static-RSA key exchange.
+    ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256';
+
+    ssl_ecdh_curve X25519:secp384r1;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:RegalyticsTLS:10m;
+    ssl_session_tickets off;
+
+    # --- Security headers (edge enforcement of 5.5 / 5.6) -------------------
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'" always;
+    server_tokens off;   # hide nginx version
+
+    # --- Frontend (built static files) --------------------------------------
+    root /var/www/regalytics/dist;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;   # SPA fallback
+    }
+
+    # --- API reverse proxy --------------------------------------------------
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000/;   # FastAPI (uvicorn) upstream
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# Redirect plain HTTP to HTTPS.
+server {
+    listen 80;
+    server_name regalyticshub.ubl.com.pk;
+    return 301 https://$host$request_uri;
+}

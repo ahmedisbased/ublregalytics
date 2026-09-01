@@ -1,0 +1,19 @@
+// src/styles/_variables.scss
+
+// 1. Define your custom theme palette
+$theme-primary: #003366;
+$theme-secondary: #8ccbf3;
+$theme-light: #f8f9fa;
+$theme-dark: #343a40;
+
+$primary: $theme-primary;
+$secondary: $theme-secondary;
+$light: $theme-light;
+$dark: $theme-dark;
+
+$body-bg: $theme-light;
+$body-color: $theme-dark;
+$font-family-base: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+
+@import "bootstrap/scss/functions";
+@import "bootstrap/scss/variables";

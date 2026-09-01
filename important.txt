@@ -1,0 +1,17 @@
+1. in api.ts i need to remove the url2 variable to make it work in prod
+
+2. in .env change these : 
+VITE_API_BASE_URL="/"
+VITE_API_LOGIN_URL="/login"
+
+to : 
+VITE_API_BASE_URL="/api/"
+VITE_API_LOGIN_URL="/login"
+
+
+in app/core/config.py i have changed the LOGIN_RATE_MAX_ATTEMPTS to 100 by default, gotta change that back to 5.LOGIN_RATE_MAX_ATTEMPTS
+
+
+
+
+

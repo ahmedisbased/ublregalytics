@@ -1,0 +1,66 @@
+.xml-generator-page {
+  padding: 2rem 0;
+}
+
+
+.xml-instructions-panel {
+  position: sticky;
+  top: 1rem;
+  background-color: rgba(140, 203, 243, 0.15) !important;
+
+  ol {
+    counter-reset: step-counter;
+    list-style: none;
+    padding-left: 0;
+
+    li {
+      counter-increment: step-counter;
+      display: flex;
+      align-items: flex-start;
+      gap: 0.6rem;
+      margin-bottom: 0.65rem;
+      font-size: 0.85rem;
+      line-height: 1.5;
+
+      &::before {
+        content: counter(step-counter);
+        flex-shrink: 0;
+        width: 1.35rem;
+        height: 1.35rem;
+        background-color: #8ccbf3;
+        color: #fff;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.7rem;
+        font-weight: 700;
+        margin-top: 0.05rem;
+      }
+    }
+  }
+}
+
+
+.xml-generate-btn {
+  min-width: 0;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+
+  .xml-generate-btn-text {
+    font-size: 14px;
+    pointer-events: none;
+  }
+}
+
+.xml-result-section {
+  padding: 1rem;
+  background-color: rgba(140, 203, 243, 0.1);
+  border-radius: 0.5rem;
+}
+
+.xml-download-btn {
+  cursor: pointer;
+  font-size: 14px;
+}
+

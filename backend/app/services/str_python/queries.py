@@ -1,0 +1,5989 @@
+
+def get_individual_query(account_number, transaction_id, from_date, to_date):
+	
+    
+    p_acct_no = str(account_number)
+    p_trxn_no = str(transaction_id)
+    p_date_from = str(from_date) if from_date else 'NULL'
+    p_date_to = str(to_date) if from_date else 'NULL'
+    
+
+    q = rf"""with base as (SELECT FACT.* ,REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+    CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB' WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+    FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+    LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+    LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+    LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+    WHERE 1=1 
+    AND RVSL_SEQ_NUM IS NULL 
+    AND REVERAL_IND = 'N'
+    AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+    AND FACT.ACCT_SROGT_ID= '{p_acct_no}' --'291808031' -- : '329634296'  
+    /*AND (P_TXN_NO IS NULL OR P_TXN_NO = '' OR CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, :P_TXN_NO , ',') 
+    RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )*/
+    AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE(null , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+    AND COALESCE(null  , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+    ),
+    acct_calc as (
+    select
+    base.* ,
+    right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+    right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+    length(to_num) as to_len
+    from  base
+    ),
+
+    final_calc as (
+    select 
+    acct_calc.* ,
+    COALESCE(
+    case when ACCT_SROGT_ID = fri_9 then
+    CASE 
+    WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+    WHEN TO_LEN >= 15 THEN TO_12
+    ELSE TO_9
+    END
+    WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+    THEN FRI_9
+    WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+    IBAN_VAL,
+    BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+    FROM acct_calc 
+    ),
+
+    MAIN_FACT_CTE AS (
+    SELECT  DISTINCT 
+    final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+    TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+    CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+    ROW_NUMBER() OVER (
+    PARTITION BY FCT_COUNTER_PRTY_ACCT
+    ORDER BY TSACTN_AMT DESC ) AS RN
+    FROM  final_calc 
+    LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+    ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+    LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+    ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+    WHERE 1=1
+    qualify rn =1
+    ) ,
+
+    CT_PARTY_3_YEAR_AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+    ACCT_SROGT_ID
+    FROM (
+    select DISTINCT
+    CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+    CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+    from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+    inner join main_fact_cte mfc
+    on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+    WHERE  1 =1   
+    AND FT.RVSL_SEQ_NUM IS NULL 
+    AND FT.Reveral_IND = 'N'
+    and mfc.FCT_COUNTER_PRTY_ACCT is not null
+    and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+    and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+    )  A
+    group by ACCT_SROGT_ID 
+                    ) ,
+    final_output as (
+
+    SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+    -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_country,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+    WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+    -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+    WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+    CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+    CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+    from   main_fact_CTE MAIN_FACT
+    LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+    on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    --- main client SUB QUERY
+    left join
+    ( 
+    WITH AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+    FROM (
+    select DISTINCT 
+    CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+    CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+    from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+    WHERE  1 =1   
+    AND ACCT_SROGT_ID=   '{p_acct_no}' -- '291808031' --: '329634296'  
+    AND RVSL_SEQ_NUM IS NULL 
+    AND Reveral_IND = 'N'
+    and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+    and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+    )  A
+    group by ACCT_SROGT_ID  										
+                    )
+    select 
+    'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+    b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+    b.Branch_Code as teller,
+    e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+    c.ACCT_SROGT_ID as account_ , C.IBAN_NUM , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+    case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+    d.GNDR as gender, d.TITL as title_  ,
+    -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+    CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+    ELSE 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+    END AS  Last_name,
+    case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+    CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+    case when d.MBL_NUM is not null then 'PAPVT' 
+    when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+    case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+    case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+    when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+    when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+    else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+    case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+    else substr(d.PHN_BUSN,2,12) end as tph_number,
+    case when d.PERM_ADDR is not null then 'PAPVT' 
+    when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+    case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+    d.CTRY_OF_NTLTY AS country_code, 
+    case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+    case
+    when FMC.STATE_LOC = 'NW' then 'KPK'
+    when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+    when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+    when FMC.STATE_LOC = 'SD' then 'SINDH'
+    when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+    when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+    when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+    END) AS state , 
+    case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+    else c.SRC_OTHR  end as Occupation, 
+    TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+    CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+    when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+    when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+    ELSE 'ASOTH' END AS STATUS_CODE,
+    i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+    from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+    inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+    inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+    inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+    inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+    left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+    where 1=1
+    and   c.ACCT_SROGT_ID =  '{p_acct_no}' 
+    ) MAIN_CLIENT 
+    ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+    ------ COUNTER PARTY 
+    left join
+    ( 
+    select 
+    'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+    b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+    e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+    c.ACCT_SROGT_ID as account_ , C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+    b.Branch_Code as teller,
+    case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+    d.GNDR as gender, d.TITL as title_  ,
+    -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+    CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+    ELSE 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+    END AS  Last_name,
+    case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+    CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+    case when d.MBL_NUM is not null then 'PAPVT' 
+    when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+    case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+    case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+    when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+    when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+    else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+    case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+    else substr(d.PHN_BUSN,2,12) end as tph_number,
+    case when d.PERM_ADDR is not null then 'PAPVT' 
+    when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+    case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+    d.CTRY_OF_NTLTY AS country_code, 
+    case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+    case
+    when FMC.STATE_LOC = 'NW' then 'KPK'
+    when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+    when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+    when FMC.STATE_LOC = 'SD' then 'SINDH'
+    when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+    when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+    when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+    END) AS state ,  
+    case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+    else c.SRC_OTHR  end as Occupation, 
+    TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+    CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+    when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+    when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+    ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+    from   MAIN_FACT_CTE MAIN_FACT 
+    inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+    inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+    inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+    inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+    --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+    where 1=1
+    ) CT_PART
+    ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    WHERE  1 =1  
+    and (ttmc_Account_ is not null and TFMC_account_ is not null )
+    /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+    and (TTMC_title is not null and TFMC_title is not null )
+    and (TTMC_state is not null and TFMC_state is not null )
+    and (TTMC_city is not null and TFMC_city is not null )*/
+    )
+    select main_Acc,
+    transactionnumber,
+    date_transaction,
+    authorized,
+    teller,
+    amount_local,
+    transmode_code,
+    to_funds_code,
+    from_funds_code,
+    CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+    CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+    CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+    CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+    CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+    CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+    CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+    CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+    CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+    CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+    CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+    CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+    CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+    CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+    CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+    CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+    CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+    CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+    CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+    CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+    CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+    CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+    CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+    CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+    CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+    CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+    CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+    CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+    CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+    CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+    CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+    CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+    CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+    CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+    CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+    CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+    CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+    CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+    CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+    CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+    CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+    CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+    CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+    CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+    CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+    CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+    CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+    CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+    CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+    CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+    CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+    CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+    CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+    CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+    CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+    CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+    CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+    CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+    CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+    CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+    CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+    CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+    CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+    CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+    CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+    CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+    CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+    CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+    CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+    CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+    from final_output"""
+
+
+    return q
+
+
+
+def get_entity_query(account_number):
+    q = rf"""
+    WITH ENTITY_MAIN_ACCT AS ( 
+    SELECT  
+        C.ACCT_SROGT_ID, 
+        C.ACCT_TITL, 
+        CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+        D.IDNTFTN_VAL, 
+        D.CUST_SROGT_ID, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS MLG_ADDR
+    FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+    INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+       AND D.SYSTEM_CODE = 'CBS' 
+    WHERE C.ACCT_SROGT_ID = '322379109'
+    ), 
+
+    DIM_CUST AS ( 
+    SELECT  
+        DC.CUST_SROGT_ID, 
+        DC.IDNTFTN_VAL, 
+        CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+        CASE 
+            WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+            WHEN NEW_MOBILE LIKE '+92%'  THEN SUBSTR(NEW_MOBILE,4) 
+            WHEN NEW_MOBILE LIKE '3%'    THEN '0'||NEW_MOBILE 
+            WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+            WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3) 
+            ELSE NEW_MOBILE 
+        END AS MOBILE, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS MLG_ADDR, 
+        DC.SYSTEM_CODE, 
+        DC.CUST_TYPE_EDW_ID, 
+        C.CUST_TYPE_DESC,  
+        C.CUST_TYPE_CD,
+        ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID, DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN 
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC 
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C 
+        ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS' 
+    INNER JOIN ENTITY_MAIN_ACCT EM 
+    ON (
+        COALESCE(DC.PERM_ADDR, 'abc') = COALESCE(EM.PERM_ADDR, 'abc')
+        OR COALESCE(
+             OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]'),
+             '123'
+           ) = COALESCE(NULLIF(EM.MOBILE,''), 'x12x')
+        OR COALESCE(DC.IDNTFTN_VAL, 'abc') = COALESCE(EM.IDNTFTN_VAL, 'abc')
+        OR COALESCE(DC.MLG_ADDR, 'abc') = COALESCE(EM.MLG_ADDR, 'abc')
+        OR COALESCE(DC.E_ML_ADDR, 'abc') = COALESCE(EM.E_ML_ADDR, 'abc')
+    )
+    WHERE DC.SYSTEM_CODE = 'CBS'
+    ),
+    RB_RELATED_ACCTS AS ( 
+    SELECT DISTINCT 
+        C.ACCT_SROGT_ID  AS ACCT_NO 
+    FROM ENTITY_MAIN_ACCT EM
+    INNER JOIN DIM_CUST D ON D.SYSTEM_CODE = 'CBS'
+    LEFT JOIN DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+    WHERE 1=1
+	AND D.CUST_TYPE_CD IN ('03','31','32','33','34','35','36','37','38')
+	and C.ACCT_SROGT_ID  <>  '322379109'
+    )
+    ,
+
+    CLEAN_NAME AS (
+    SELECT 
+        REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') AS NAME_CLEAN,
+        D.*
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW D
+    ),
+    DIM_CUST_VW AS (
+    SELECT  
+        D.CUST_SROGT_ID,
+        D.FTHR_NAME AS mothers_name, 
+        D.IDNTFTN_VAL AS ssn, 
+        D.CTRY_OF_NTLTY AS nationality1,
+        D.GNDR AS gender,
+        TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1)) AS first_name,
+        CASE 
+            WHEN TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1)) = '' 
+            THEN TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1))
+            ELSE TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1))
+        END AS last_name,
+        D.CUST_TYPE_EDW_ID,
+        D.CTRY_OF_NTLTY AS to_country,  
+        D.CUST_SROGT_ID AS CUST_NUM, 
+        CAST(D.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+        CASE WHEN D.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+        CASE WHEN D.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+        CASE 
+            WHEN D.MBL_NUM IS NOT NULL AND (SUBSTR(D.MBL_NUM,0,2) = '92' OR SUBSTR(D.MBL_NUM,1,3) = '92') THEN '92'
+            WHEN LENGTH(SUBSTR(D.MBL_NUM,2,12)) = 10 OR LENGTH(SUBSTR(D.MBL_NUM,3,13)) = 10 THEN '92'
+            WHEN D.CTRY_OF_NTLTY = 'PK' THEN '92'
+            ELSE SUBSTR(D.MBL_NUM,0,2) 
+        END AS tph_country_prefix,
+        COALESCE(REGEXP_SUBSTR(D.MBL_NUM,'3.*'), SUBSTR(D.PHN_BUSN,2,12)) AS tph_number,
+        CASE WHEN D.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+        COALESCE(D.MLG_ADDR, D.PERM_ADDR) AS address,
+        D.CTRY_OF_NTLTY AS country_code, 
+        CASE 
+            WHEN D.RSDNTL_CITY = '0' OR D.RSDNTL_CITY IS NULL 
+            THEN TRIM(REGEXP_SUBSTR(location,'[A-Z a-z]+')) 
+            ELSE D.RSDNTL_CITY 
+        END AS city,
+        COALESCE(D.RGN_NAME,
+            CASE FMC.STATE_LOC
+                WHEN 'NW' THEN 'KPK'
+                WHEN 'AK' THEN 'AZAD KASHMIR'
+                WHEN 'PJ' THEN 'PUNJAB'
+                WHEN 'SD' THEN 'SINDH'
+                WHEN 'BL' THEN 'BALOCHISTAN'
+                WHEN 'IS' THEN 'ISLAMABAD'
+                WHEN 'GB' THEN 'GILGIT-BALISTAN'
+                WHEN 'FA' THEN 'GILGIT-BALISTAN'
+            END
+        ) AS state,
+        'UNITED BANK LIMITED' AS institution_name,  
+        'UNILPKKA' AS swift, 
+        'PK' AS institution_country,
+        'ETPVT' AS incorporation_legal_form,
+		e.CUST_TYPE_CD as CUST_TYPE_CD,
+		e.CUST_TYPE_DESC as CUST_TYPE_DESC
+    FROM CLEAN_NAME D
+    INNER JOIN dp_wrk_cbs.fm_client_daily FMC ON D.CUST_SROGT_ID = FMC.client_no AND D.system_code = 'CBS'
+    INNER JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS E ON E.CUST_TYPE_EDW_ID = D.CUST_TYPE_EDW_ID
+    )
+    -- Mandate Client
+    SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+    'MANDATE_CLIENT' AS TYP, MA.CLIENT_NO, 'ARPYS' AS ROLE_OUTER,    dc.CUST_SROGT_ID,
+       dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+       dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+       dc.address,       dc.country_code,       dc.city,       dc.state,
+       dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+	       b.BRNCH_DESC AS branch, 
+        COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+        b.Branch_Code AS teller,
+        DIM_ACCT.ACCT_SROGT_ID AS account_, 
+        DIM_ACCT.IBAN_NUM, 
+        DIM_ACCT.CURY_EDW_ID AS currency_code,
+        DIM_ACCT.ACCT_TITL AS account_name,
+        DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+        DIM_ACCT.SRC_OF_FUND AS business, 
+        CASE 
+            WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+            WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+            WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+            ELSE 'ARCTA' 
+        END AS Role_, 
+        CASE 
+            WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+            WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+            WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+        END AS account_type,
+        TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+        CASE 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+            ELSE 'ASOTH' 
+        END AS STATUS_CODE
+    FROM DIM_CUST_VW DC
+    LEFT JOIN DP_REPORTING_MART.TM_DM_MD_MANDATE_AUTHORIZE MA ON DC.CUST_SROGT_ID = MA.CLIENT_NO   AND CAST(MA.START_DATE AS DATE) = CURRENT_DATE - 1 
+    INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.ACCT_SROGT_ID = MA.ACCT_NO
+    LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+    INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+
+    --WHERE DIM_ACCT.ACCT_SROGT_ID = '323477174'
+
+    UNION ALL
+
+    -- Director Client
+    SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'DIRECTOR_CLIENT' AS TYP, DRC.CLIENT_NO, 'ARPYS' AS ROLE_OUTER,     dc.CUST_SROGT_ID,
+       dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+       dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+       dc.address,       dc.country_code,       dc.city,       dc.state,
+       dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+	       b.BRNCH_DESC AS branch, 
+        COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+        b.Branch_Code AS teller,
+        DIM_ACCT.ACCT_SROGT_ID AS account_, 
+        DIM_ACCT.IBAN_NUM, 
+        DIM_ACCT.CURY_EDW_ID AS currency_code,
+        DIM_ACCT.ACCT_TITL AS account_name,
+        DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+        DIM_ACCT.SRC_OF_FUND AS business, 
+        CASE 
+            WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+            WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+            WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+            ELSE 'ARCTA' 
+        END AS Role_, 
+        CASE 
+            WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+            WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+            WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+        END AS account_type,
+        TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+        CASE 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+            ELSE 'ASOTH' 
+        END AS STATUS_CODE
+    FROM DIM_CUST_VW DC
+    INNER JOIN DP_REPORTING_MART.FM_DIRECTOR_DTLS DRC ON DC.CUST_SROGT_ID = DRC.CLIENT_NO_DIR AND CAST(DRC.START_DATE AS DATE) = CURRENT_DATE - 1 
+    INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DRC.CLIENT_NO
+    LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+    INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+
+    UNION ALL
+
+    -- Main Client
+    SELECT DISTINCT  DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'MAIN_CLIENT' AS TYP, CAST(DC.CUST_NUM AS VARCHAR(100)) AS CLIENT_NO,
+       CAST('' AS VARCHAR(100)) AS ROLE_OUTER,    dc.CUST_SROGT_ID,
+       dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+       dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+       dc.address,       dc.country_code,       dc.city,       dc.state,
+       dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+	       b.BRNCH_DESC AS branch, 
+        COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+        b.Branch_Code AS teller,
+        DIM_ACCT.ACCT_SROGT_ID AS account_, 
+        DIM_ACCT.IBAN_NUM, 
+        DIM_ACCT.CURY_EDW_ID AS currency_code,
+        DIM_ACCT.ACCT_TITL AS account_name,
+        DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+        DIM_ACCT.SRC_OF_FUND AS business, 
+        CASE 
+            WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+            WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+            WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+            ELSE 'ARCTA' 
+        END AS Role_, 
+        CASE 
+            WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+            WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+            WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+        END AS account_type,
+        TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+        CASE 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+            ELSE 'ASOTH' 
+        END AS STATUS_CODE
+        FROM DIM_CUST_VW DC
+    INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DC.CUST_SROGT_ID
+    LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+    INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+
+
+
+
+
+    """
+    return q
+
+
+
+
+def get_cbs_cc_query(account_number):
+    q = rf"""
+    WITH ENTITY_MAIN_ACCT AS (
+  SELECT 
+    C.ACCT_SROGT_ID,
+    C.ACCT_TITL,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+    OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+    D.IDNTFTN_VAL,
+    D.CUST_SROGT_ID,
+    CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+    CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+    C.SRC_OTHR,
+    C.SRC_OF_INCM,
+    C.SRC_OF_FUND
+  FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+    ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+   AND D.SYSTEM_CODE = 'CBS'
+  WHERE C.ACCT_SROGT_ID = '326247471' --'326247471'
+    ),
+
+    DIM_CUST AS (
+  SELECT *
+  FROM (
+    SELECT 
+      DC.CUST_SROGT_ID,
+      DC.IDNTFTN_VAL,
+	  C.CUST_TYPE_CD,
+      COALESCE(D.OCPTN_DESC, C.CUST_TYPE_DESC) AS OCCUPATION,
+      CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+      OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+      CASE 
+        WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+        WHEN NEW_MOBILE LIKE '+92%' THEN SUBSTR(NEW_MOBILE,4) 
+        WHEN NEW_MOBILE LIKE '3%' THEN '0'||NEW_MOBILE
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3)
+        ELSE NEW_MOBILE  
+      END AS MOBILE,
+      CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+      CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+      DC.SYSTEM_CODE,
+      CAST(DC.FTHR_NAME AS VARCHAR(100)) AS mothers_name, 
+      DC.IDNTFTN_VAL AS ssn, 
+      DC.CTRY_OF_NTLTY AS nationality1,
+      DC.GNDR AS gender,
+      CAST(TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+           FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) AS VARCHAR(50)) AS first_name,
+      CAST(CASE 
+        WHEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) = '' 
+        THEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) 
+        ELSE TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) 
+      END AS VARCHAR(50)) AS last_name,
+      DC.CUST_TYPE_EDW_ID,
+      DC.CTRY_OF_NTLTY AS to_country,
+      DC.CUST_SROGT_ID AS CUST_NUM, 
+      CAST(DC.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+      CASE 
+        WHEN DC.MBL_NUM IS NOT NULL AND (SUBSTR(DC.MBL_NUM,0,2)='92' OR SUBSTR(DC.MBL_NUM,1,3)='92') THEN '92'
+        WHEN LENGTH(SUBSTR(DC.MBL_NUM,2,12))=10 OR LENGTH(SUBSTR(DC.MBL_NUM,3,13))=10 THEN '92'
+        WHEN DC.CTRY_OF_NTLTY='PK' THEN '92'
+        ELSE SUBSTR(DC.MBL_NUM,0,2) 
+      END AS tph_country_prefix,
+      COALESCE(REGEXP_SUBSTR(DC.MBL_NUM,'3.*'), SUBSTR(DC.PHN_BUSN,2,12)) AS tph_number,
+      CASE WHEN DC.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+      CAST(COALESCE(DC.MLG_ADDR, DC.PERM_ADDR) AS VARCHAR(200)) AS address,
+      DC.CTRY_OF_NTLTY AS country_code,
+      C.CUST_TYPE_DESC,
+      CAST(CASE 
+        WHEN DC.RSDNTL_CITY='0' OR DC.RSDNTL_CITY IS NULL 
+        THEN TRIM(REGEXP_SUBSTR(FMC.location,'[A-Z a-z]+')) 
+        ELSE DC.RSDNTL_CITY 
+      END AS VARCHAR(100)) AS city,
+      CAST(COALESCE(DC.RGN_NAME,
+          CASE FMC.STATE_LOC
+              WHEN 'NW' THEN 'KPK'
+              WHEN 'AK' THEN 'AZAD KASHMIR'
+              WHEN 'PJ' THEN 'PUNJAB'
+              WHEN 'SD' THEN 'SINDH'
+              WHEN 'BL' THEN 'BALOCHISTAN'
+              WHEN 'IS' THEN 'ISLAMABAD'
+              WHEN 'GB' THEN 'GILGIT-BALISTAN'
+              WHEN 'FA' THEN 'GILGIT-BALISTAN'
+          END
+      ) AS VARCHAR(100)) AS state,             
+      ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID,DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC
+    LEFT JOIN dp_wrk_cbs.fm_client_daily FMC ON DC.CUST_SROGT_ID = FMC.client_no 
+    LEFT JOIN DP_sDMT_DFDN.DIM_OCPTN D ON D.OCPTN_EDW_ID = DC.OCPTN_EDW_ID AND D.OCPTN_CD IS NOT NULL
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS'
+    LEFT JOIN ENTITY_MAIN_ACCT EM1 ON DC.IDNTFTN_VAL = EM1.IDNTFTN_VAL
+    LEFT JOIN ENTITY_MAIN_ACCT EM2 ON OREPLACE(COALESCE(DC.MBL_NUM,DC.PHN_BUSN,DC.PHN_RSDNC),'[^0-9]') = EM2.MOBILE
+    LEFT JOIN ENTITY_MAIN_ACCT EM3 ON DC.PERM_ADDR = EM3.PERM_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM4 ON DC.MLG_ADDR = EM4.MLG_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM5 ON DC.E_ML_ADDR = EM5.E_ML_ADDR
+    WHERE DC.SYSTEM_CODE <> 'OMI'
+      AND (EM1.IDNTFTN_VAL IS NOT NULL OR EM2.MOBILE IS NOT NULL 
+           OR EM3.PERM_ADDR IS NOT NULL OR EM4.MLG_ADDR IS NOT NULL OR EM5.E_ML_ADDR IS NOT NULL)
+  ) Q
+  WHERE RN = 1
+    ),
+    RB_RELATED_ACCTS AS (
+  SELECT DISTINCT 
+    CAST(C.ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_NO,
+	CAST(CUST_TYPE_CD AS VARCHAR (100)) AS CUST_TYPE_CD,
+	CAST(CUST_TYPE_DESC AS VARCHAR(100)) AS CUST_TYPE_DESC,
+    CAST(C.CUST_SROGT_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+    CAST(C.ACCT_TITL AS VARCHAR(200)) AS ACCT_TITLE,
+    CAST(TO_CHAR(C.ACCT_OPN_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+    CAST(DA.ACCT_STS_DESC AS VARCHAR(50)) AS ACCT_STATUS,
+    CAST(TO_CHAR(C.ACCT_CLS_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_CLOSE_DATE,
+    CAST(C.BRNCH_SROGT_ID AS VARCHAR(50)) AS BRANCH,
+    CAST(C.CURY_EDW_ID AS VARCHAR(10)) AS CCY,
+	
+	case when D.CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when C.JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when D.CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,
+
+    CASE WHEN C.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when C.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+				when C.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when C.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+				when C.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+				ELSE 'ASOTH' END AS STATUS_CODE,
+
+    CAST(TRIM(COALESCE(
+      CASE WHEN EM.SRC_OF_FUND IN ('1','2','3') THEN D.OCCUPATION ELSE OREPLACE(EM.SRC_OF_FUND,'_') END
+    ,'-')) AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+    CAST(D.IDNTFTN_VAL AS VARCHAR(30)) AS CNIC,
+    CAST(D.MOBILE AS VARCHAR(30)) AS MOBILE,  
+    CAST(D.MLG_ADDR AS VARCHAR(200)) AS MAILING_ADDRESS,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS EMAIL_ADDRESS,
+    CAST(D.PERM_ADDR AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+    CAST(D.SYSTEM_CODE AS VARCHAR(10)) AS SYSTEM_CODE,
+    CAST(CASE 
+      WHEN D.MOBILE = EM.MOBILE AND EM.MOBILE <> '' THEN 'Mobile Matched'
+      WHEN D.E_ML_ADDR = EM.E_ML_ADDR AND EM.E_ML_ADDR <> '' THEN 'Email Matched'
+      WHEN D.IDNTFTN_VAL = EM.IDNTFTN_VAL AND EM.IDNTFTN_VAL <> '' THEN 'CNIC Matched'
+      WHEN D.PERM_ADDR = EM.PERM_ADDR AND D.PERM_ADDR <> '' THEN 'Address Matched'
+    END AS VARCHAR(50)) AS Reason,
+    CAST(mothers_name AS VARCHAR(100)) AS mothers_name,
+    CAST(ssn AS VARCHAR(30)) AS ssn,
+    CAST(nationality1 AS VARCHAR(50)) AS nationality1,
+    CAST(gender AS VARCHAR(10)) AS gender,
+    CAST(first_name AS VARCHAR(50)) AS first_name,
+    CAST(last_name AS VARCHAR(50)) AS last_name,
+    CAST(to_country AS VARCHAR(50)) AS to_country,
+    CAST(birthdate AS VARCHAR(20)) AS birthdate,
+    CAST(tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+    CAST(tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+    CAST(tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+    CAST(tph_number AS VARCHAR(30)) AS tph_number,
+    CAST(address_type AS VARCHAR(20)) AS address_type,
+    CAST(D.address AS VARCHAR(200)) AS address,
+    CAST(country_code AS VARCHAR(10)) AS country_code,
+    CAST(city AS VARCHAR(100)) AS city,
+    CAST(state AS VARCHAR(100)) AS state,
+    CAST(COALESCE(
+      NULLIF(TRIM(EM.SRC_OTHR),''),
+      NULLIF(TRIM(EM.SRC_OF_INCM),''),
+      NULLIF(TRIM(EM.SRC_OF_FUND),''),
+      D.CUST_TYPE_DESC
+    ) AS VARCHAR(200)) AS occupation,
+    CAST(R.NRRTV AS VARCHAR(200)) AS NRRTV,
+    CAST(R.RSTRNT_TYPE_EDW_ID AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+  FROM ENTITY_MAIN_ACCT EM 
+  LEFT JOIN DIM_CUST D  
+    ON ((D.MOBILE = EM.MOBILE AND EM.MOBILE <> '') 
+     OR (D.E_ML_ADDR = EM.E_ML_ADDR AND EM.E_ML_ADDR <> '')
+     OR (D.IDNTFTN_VAL = EM.IDNTFTN_VAL AND EM.IDNTFTN_VAL <> '') 
+     OR (D.PERM_ADDR = EM.PERM_ADDR AND D.PERM_ADDR <> '')) 
+   AND D.SYSTEM_CODE = 'CBS'  
+  LEFT JOIN DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+    ON D.CUST_SROGT_ID = C.CUST_SROGT_ID AND D.SYSTEM_CODE = 'CBS'  
+  LEFT JOIN DP_sDMT_DFDN.DIM_ACCT_STS_SS DA 
+    ON DA.ACCT_STS_EDW_ID = C.ACCT_STS_EDW_ID AND DA.SYSTEM_CODE = 'CBS'
+  LEFT JOIN (
+    SELECT ACCT_SROGT_ID, NRRTV, RSTRNT_TYPE_EDW_ID
+    FROM (
+      SELECT ACCT_SROGT_ID, NRRTV, RSTRNT_STRT_DT, RSTRNT_TYPE_EDW_ID,
+             ROW_NUMBER() OVER(PARTITION BY ACCT_SROGT_ID ORDER BY RSTRNT_STRT_DT DESC) AS RN
+      FROM DP_SDMVW_DFDN.FCT_RTAIL_BNK_ACCT_RSTRNT_VW
+      WHERE RSTRNT_TYPE_EDW_ID = 'RFA'
+        AND RSTRNT_STS = 'A'
+        AND cast(BATCH_DT as date) = CURRENT_DATE-1
+    ) Q
+    WHERE RN=1
+  ) R ON C.ACCT_SROGT_ID = R.ACCT_SROGT_ID
+  --where  c.ACCT_SROGT_ID <> '326247471'
+
+  UNION ALL
+
+  SELECT DISTINCT
+    CAST(DC.CARD_NUM AS VARCHAR(100)) AS ACCT_NO,
+		'' AS CUST_TYPE_CD,
+	'' AS CUST_TYPE_DESC,
+    CAST(DC.CUST_SROGT_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+    CAST(DC.EMBS_NAME AS VARCHAR(200)) AS ACCT_TITL,
+    CAST(TO_CHAR(DC.CARD_CRTN_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+    CAST(DA.ACCT_STS_DESC AS VARCHAR(50)) AS ACCT_STATUS,
+    CAST(TO_CHAR(DC.CARD_CLSUR_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_CLOSE_DATE,
+    '-' AS BRANCH,
+	    'PKR' AS CCY,
+    ' ' AS ROLE_,
+	'' AS STATUS_CODE,
+    CAST(D.OCCUPATION AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+    CAST(D.IDNTFTN_VAL AS VARCHAR(30)) AS CNIC,
+    CAST(D.MOBILE AS VARCHAR(30)) AS MOBILE,  
+    CAST(D.MLG_ADDR AS VARCHAR(200)) AS MAILING_ADDRESS,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS EMAIL_ADDRESS,
+    CAST(D.PERM_ADDR AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+    CAST(D.SYSTEM_CODE AS VARCHAR(10)) AS SYSTEM_CODE,
+    CAST('CNIC Matched' AS VARCHAR(50)) AS Reason,
+    CAST(mothers_name AS VARCHAR(100)) AS mothers_name,
+    CAST(ssn AS VARCHAR(30)) AS ssn,
+    CAST(nationality1 AS VARCHAR(50)) AS nationality1,
+    CAST(gender AS VARCHAR(10)) AS gender,
+    CAST(first_name AS VARCHAR(50)) AS first_name,
+    CAST(last_name AS VARCHAR(50)) AS last_name,
+    CAST(to_country AS VARCHAR(50)) AS to_country,
+    CAST(birthdate AS VARCHAR(20)) AS birthdate,
+    CAST(tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+    CAST(tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+    CAST(tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+    CAST(tph_number AS VARCHAR(30)) AS tph_number,
+    CAST(address_type AS VARCHAR(20)) AS address_type,
+    CAST(D.address AS VARCHAR(200)) AS address,
+    CAST(country_code AS VARCHAR(10)) AS country_code,
+    CAST(city AS VARCHAR(100)) AS city,
+    CAST(state AS VARCHAR(100)) AS state,
+    CAST('' AS VARCHAR(200)) AS occupation,
+    CAST('' AS VARCHAR(200)) AS NRRTV,
+    CAST('' AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+   FROM  DP_SDMT_DFDN.DIM_CARD_SS DC
+    LEFT JOIN DIM_CUST D ON D.CUST_sROGT_ID = DC.CUST_sROGT_ID AND D.SYSTEM_CODE = 'CTL'
+    LEFT JOIN DP_sDMT_DFDN.DIM_ACCT_STS_SS DA ON DA.ACCT_STS_EDW_ID = DC.CARD_STS_EDW_ID AND DA.SYSTEM_cODE = 'CTL'
+    WHERE DC.SYSTEM_CODE = 'CTL'
+    AND D.IDNTFTN_VAL IN (SELECT IDNTFTN_VAL FROM ENTITY_MAIN_ACCT)
+    ),
+
+    FACT_TRXNS AS (
+  SELECT 
+    CAST(ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_NO,
+    SUM(CREDIT_AMT) AS CREDIT_AMT,
+    SUM(DEBIT_AMT) AS DEBIT_AMT,
+    SUM(NO_OF_CREDITS) AS NO_OF_CREDITS,
+    SUM(NO_OF_DEBITS) AS NO_OF_DEBITS
+  FROM (
+    SELECT DISTINCT 
+      CAST(ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_SROGT_ID, 
+      TSACTN_ID,
+      CASE WHEN CR_DR_IND = 'C' AND SRC_TYP <> 'NI' THEN TSACTN_AMT ELSE 0 END AS CREDIT_AMT,
+      CASE WHEN CR_DR_IND = 'D' THEN TSACTN_AMT ELSE 0 END AS DEBIT_AMT,
+      CASE WHEN CR_DR_IND = 'C' AND SRC_TYP <> 'NI' THEN 1 ELSE 0 END AS NO_OF_CREDITS,
+      CASE WHEN CR_DR_IND = 'D' THEN 1 ELSE 0 END AS NO_OF_DEBITS
+    FROM DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW  
+    INNER JOIN RB_RELATED_ACCTS RB ON ACCT_SROGT_ID = RB.ACCT_NO
+    WHERE CAST(TSACTN_TMSTP AS DATE) BETWEEN ADD_MONTHS(CURRENT_DATE-1,-36) AND CURRENT_DATE-1
+      AND RVSL_SEQ_NUM IS NULL 
+      AND Reveral_IND = 'N'
+  ) A
+  GROUP BY ACCT_SROGT_ID
+
+  UNION ALL
+
+  SELECT 
+    CAST(ACCT_NO AS VARCHAR(100)) AS ACCT_NO,
+    SUM(CREDIT_AMT) AS CREDIT_AMT,
+    SUM(DEBIT_AMT) AS DEBIT_AMT,
+    SUM(NO_OF_CREDITS) AS NO_OF_CREDITS,
+    SUM(NO_OF_DEBITS) AS NO_OF_DEBITS
+  FROM (
+    SELECT 
+      CAST(FCT.CARD_NUM AS VARCHAR(100)) AS ACCT_NO,
+      CASE WHEN TSACTN_AMT > 0 THEN TSACTN_AMT ELSE 0 END AS CREDIT_AMT,
+      CASE WHEN TSACTN_AMT <= 0 THEN TSACTN_AMT * -1 ELSE 0 END AS DEBIT_AMT,
+      CASE WHEN TSACTN_AMT > 0 THEN 1 ELSE 0 END AS NO_OF_CREDITS,
+      CASE WHEN TSACTN_AMT <= 0 THEN 1 ELSE 0 END AS NO_OF_DEBITS                           
+    FROM DP_SDMT_DFDN.FCT_CR_CARD_TSACTN FCT
+    INNER JOIN RB_RELATED_ACCTS RB ON FCT.CARD_NUM = RB.ACCT_NO
+    WHERE CAST(TSACTN_DT AS DATE) BETWEEN ADD_MONTHS(CURRENT_DATE-1,-36) AND CURRENT_DATE-1
+  ) Q
+  GROUP BY ACCT_NO
+    ),
+
+
+    FINAL_OUTPUT AS (
+    SELECT 
+  CAST(RB.ACCT_NO AS VARCHAR(100)) AS ACCT_NO,
+  CAST(RB.CUSTOMER_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+  CAST(RB.ACCT_TITLE AS VARCHAR(200)) AS ACCT_TITLE,
+  CAST(RB.CUST_TYPE_CD  AS VARCHAR(200)) AS CUSTOMER_TYPE_CODE,
+  CAST(RB.CUST_TYPE_DESC AS VARCHAR(200)) AS CUSTOMER_TYPE_DESC,
+  'UNITED BANK LIMITED ' as institution_name, 
+  'UNILPKKA' as swift,
+  CASE WHEN RSTRNT_TYPE_EDW_ID IS NOT NULL 
+       THEN CAST('B' AS VARCHAR(5)) 
+       ELSE CAST(RB.ACCT_STATUS AS VARCHAR(50)) END AS ACCT_STATUS,
+  CAST(RB.ACCT_OPEN_DATE AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+  COALESCE(CAST(RB.ACCT_CLOSE_DATE AS VARCHAR(20)),'-') AS ACCT_CLOSE_DATE,
+  CAST(RB.BRANCH AS VARCHAR(50)) AS BRANCH,
+  CAST(RB.STATUS_CODE AS VARCHAR(100)) AS STATUS_CODE,
+  CAST(RB.CCY AS VARCHAR(10)) AS CCY,
+  CAST(Role_ AS VARCHAR(100)) AS "ROLE",
+  CAST(RB.SOURCE_OF_FUNDS AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+  CAST(RB.CNIC AS VARCHAR(30)) AS CNIC,
+  CAST(RB.MOBILE AS VARCHAR(30)) AS MOBILE,  
+  CAST(RB.MAILING_ADDRESS AS VARCHAR(200)) AS MAILING_ADDRESS,
+  CAST(RB.EMAIL_ADDRESS AS VARCHAR(100)) AS EMAIL_ADDRESS,
+  CAST(RB.PERMANENT_ADDRESS AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+  CAST(RB.Reason AS VARCHAR(50)) AS Reason,
+  COALESCE(FT.NO_OF_CREDITS,0) AS NO_OF_CREDITS,
+  COALESCE(FT.CREDIT_AMT,0) AS CREDIT_AMT,
+  COALESCE(FT.NO_OF_DEBITS,0) AS NO_OF_DEBITS,
+  COALESCE(FT.DEBIT_AMT,0) AS DEBIT_AMT,
+  CAST(RB.mothers_name AS VARCHAR(100)) AS mothers_name,
+  CAST(RB.ssn AS VARCHAR(30)) AS ssn,
+  CAST(RB.nationality1 AS VARCHAR(50)) AS nationality1,
+  CAST(RB.gender AS VARCHAR(10)) AS gender,
+  CAST(RB.first_name AS VARCHAR(50)) AS first_name,
+  CAST(RB.last_name AS VARCHAR(50)) AS last_name,
+  CAST(RB.to_country AS VARCHAR(50)) AS to_country,
+  CAST(RB.birthdate AS VARCHAR(20)) AS birthdate,
+  CAST(RB.tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+  CAST(RB.tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+  CAST(RB.tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+  CAST(RB.tph_number AS VARCHAR(30)) AS tph_number,
+  CAST(RB.address_type AS VARCHAR(20)) AS address_type,
+  CAST(RB.address AS VARCHAR(200)) AS address,
+  CAST(RB.country_code AS VARCHAR(10)) AS country_code,
+  CAST(RB.city AS VARCHAR(100)) AS city,
+  CAST(RB.state AS VARCHAR(100)) AS state,
+  CAST(RB.occupation AS VARCHAR(200)) AS occupation,
+  CAST(RB.NRRTV AS VARCHAR(200)) AS NRRTV,
+  CAST(RB.RSTRNT_TYPE_EDW_ID AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+    FROM RB_RELATED_ACCTS RB
+    LEFT JOIN FACT_TRXNS FT ON FT.ACCT_NO = RB.ACCT_NO
+    --WHERE RB.ACCT_NO <> '326247471'
+
+    )
+    SELECT * FROM FINAL_OUTPUT
+    --where acct_no <> '326247471'
+
+   
+   
+   
+    """
+
+    return q
+
+
+
+
+
+def get_wallet_query(account_number):
+
+
+    q = rf"""
+    
+            WITH ENTITY_MAIN_ACCT AS (
+  SELECT 
+    C.ACCT_SROGT_ID,
+    C.ACCT_TITL,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+    OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+    D.IDNTFTN_VAL,
+    D.CUST_SROGT_ID,
+    CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+    CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+    C.SRC_OTHR,
+    C.SRC_OF_INCM,
+    C.SRC_OF_FUND
+  FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+    ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+   AND D.SYSTEM_CODE = 'CBS'
+  WHERE C.ACCT_SROGT_ID = '281436262' --'326247471'
+    ),
+
+    DIM_CUST AS ( 
+  SELECT *
+  FROM (
+    SELECT 
+      DC.CUST_SROGT_ID,
+      DC.IDNTFTN_VAL,
+	  C.CUST_TYPE_CD,
+      COALESCE(D.OCPTN_DESC, C.CUST_TYPE_DESC) AS OCCUPATION,
+      CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+      OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+      CASE 
+        WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+        WHEN NEW_MOBILE LIKE '+92%' THEN SUBSTR(NEW_MOBILE,4) 
+        WHEN NEW_MOBILE LIKE '3%' THEN '0'||NEW_MOBILE
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3)
+        ELSE NEW_MOBILE  
+      END AS MOBILE,
+      CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+      CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+      DC.SYSTEM_CODE,
+      CAST(DC.FTHR_NAME AS VARCHAR(100)) AS mothers_name, 
+      DC.IDNTFTN_VAL AS ssn, 
+      DC.CTRY_OF_NTLTY AS nationality1,
+      DC.GNDR AS gender,
+      CAST(TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+           FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) AS VARCHAR(50)) AS first_name,
+      CAST(CASE 
+        WHEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) = '' 
+        THEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) 
+        ELSE TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) 
+      END AS VARCHAR(50)) AS last_name,
+      DC.CUST_TYPE_EDW_ID,
+      DC.CTRY_OF_NTLTY AS to_country,
+      DC.CUST_SROGT_ID AS CUST_NUM, 
+      CAST(DC.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+      CASE 
+        WHEN DC.MBL_NUM IS NOT NULL AND (SUBSTR(DC.MBL_NUM,0,2)='92' OR SUBSTR(DC.MBL_NUM,1,3)='92') THEN '92'
+        WHEN LENGTH(SUBSTR(DC.MBL_NUM,2,12))=10 OR LENGTH(SUBSTR(DC.MBL_NUM,3,13))=10 THEN '92'
+        WHEN DC.CTRY_OF_NTLTY='PK' THEN '92'
+        ELSE SUBSTR(DC.MBL_NUM,0,2) 
+      END AS tph_country_prefix,
+      COALESCE(REGEXP_SUBSTR(DC.MBL_NUM,'3.*'), SUBSTR(DC.PHN_BUSN,2,12)) AS tph_number,
+      CASE WHEN DC.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+      CAST(COALESCE(DC.MLG_ADDR, DC.PERM_ADDR) AS VARCHAR(200)) AS address,
+      DC.CTRY_OF_NTLTY AS country_code,
+      C.CUST_TYPE_DESC,
+      CAST(CASE 
+        WHEN DC.RSDNTL_CITY='0' OR DC.RSDNTL_CITY IS NULL 
+        THEN TRIM(REGEXP_SUBSTR(FMC.location,'[A-Z a-z]+')) 
+        ELSE DC.RSDNTL_CITY 
+      END AS VARCHAR(100)) AS city,
+      CAST(COALESCE(DC.RGN_NAME,
+          CASE FMC.STATE_LOC
+              WHEN 'NW' THEN 'KPK'
+              WHEN 'AK' THEN 'AZAD KASHMIR'
+              WHEN 'PJ' THEN 'PUNJAB'
+              WHEN 'SD' THEN 'SINDH'
+              WHEN 'BL' THEN 'BALOCHISTAN'
+              WHEN 'IS' THEN 'ISLAMABAD'
+              WHEN 'GB' THEN 'GILGIT-BALISTAN'
+              WHEN 'FA' THEN 'GILGIT-BALISTAN'
+          END
+      ) AS VARCHAR(100)) AS state,             
+      ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID,DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC
+    LEFT JOIN dp_wrk_cbs.fm_client_daily FMC ON DC.CUST_SROGT_ID = FMC.client_no 
+    LEFT JOIN DP_sDMT_DFDN.DIM_OCPTN D ON D.OCPTN_EDW_ID = DC.OCPTN_EDW_ID AND D.OCPTN_CD IS NOT NULL
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS'
+    LEFT JOIN ENTITY_MAIN_ACCT EM1 ON DC.IDNTFTN_VAL = EM1.IDNTFTN_VAL
+    LEFT JOIN ENTITY_MAIN_ACCT EM2 ON OREPLACE(COALESCE(DC.MBL_NUM,DC.PHN_BUSN,DC.PHN_RSDNC),'[^0-9]') = EM2.MOBILE
+    LEFT JOIN ENTITY_MAIN_ACCT EM3 ON DC.PERM_ADDR = EM3.PERM_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM4 ON DC.MLG_ADDR = EM4.MLG_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM5 ON DC.E_ML_ADDR = EM5.E_ML_ADDR
+    WHERE DC.SYSTEM_CODE <> 'OMI'
+      AND (EM1.IDNTFTN_VAL IS NOT NULL OR EM2.MOBILE IS NOT NULL 
+           OR EM3.PERM_ADDR IS NOT NULL OR EM4.MLG_ADDR IS NOT NULL OR EM5.E_ML_ADDR IS NOT NULL)
+  ) Q
+  WHERE RN = 1
+    ),
+    RB_RELATED_ACCTS AS (
+
+    SELECT DISTINCT CAST(WLT_ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_NO, 
+  CAST(A.WLT_USR_EDW_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+  CAST(A.ACCT_TITL AS VARCHAR(100)) AS ACCT_TITL,
+    CAST(TO_CHAR(A.CRTD_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+	CAST(CASE WHEN A.ACCT_STS_EDW_ID = '2' THEN 'ACTIVE' 
+	when A.ACCT_STS_EDW_ID in ('10','3','4') THEN 'BLOCKED'
+	ELSE 'INACTIVE' END AS VARCHAR(50)) AS ACCT_STATUS,
+	'' AS ACCT_CLOSE_DATE,
+    '-' AS BRANCH,
+    'PKR' AS CCY,
+	'' AS ROLE_,
+	'' AS STATUS_CODE,
+	CAST(d.OCCUPATION AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+	CAST(C.GLOBL_ID AS VARCHAR(30)) AS CNIC,
+	CAST(A.MBL_NUM AS VARCHAR(30)) AS MOBILE,  
+	 CAST(C.ML_ADDR AS VARCHAR(200)) AS MAILING_ADDRESS,
+	CAST(C.EML_ADDR AS VARCHAR(100)) AS EMAIL_ADDRESS,
+	CAST(D.PERM_ADDR AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+	'OMI' AS SYSTEM_CODE,
+	CAST('CNIC Matched' AS VARCHAR(50)) AS Reason,
+    CAST(mothers_name AS VARCHAR(100)) AS mothers_name,
+    CAST(ssn AS VARCHAR(30)) AS ssn,
+    CAST(nationality1 AS VARCHAR(50)) AS nationality1,
+	CAST(gender AS VARCHAR(10)) AS gender,
+    CAST(first_name AS VARCHAR(50)) AS first_name,
+    CAST(last_name AS VARCHAR(50)) AS last_name,
+    CAST(to_country AS VARCHAR(50)) AS to_country,
+    CAST(birthdate AS VARCHAR(20)) AS birthdate,
+    CAST(tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+    CAST(tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+    CAST(tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+    CAST(tph_number AS VARCHAR(30)) AS tph_number,
+    CAST(address_type AS VARCHAR(20)) AS address_type,
+    CAST(D.address AS VARCHAR(200)) AS address,
+	CAST(d.CUST_TYPE_CD AS VARCHAR(200)) AS customer_type_cd,
+	CAST(d.CUST_TYPE_DESC AS VARCHAR(200)) AS customer_type_desc,
+    CAST(country_code AS VARCHAR(10)) AS country_code,
+    CAST(D.city AS VARCHAR(100)) AS city,
+    CAST(state AS VARCHAR(100)) AS state,
+    CAST(d.OCCUPATION AS VARCHAR(200)) AS occupation,
+    CAST('' AS VARCHAR(200)) AS NRRTV,
+    CAST('' AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+  FROM DP_SDMT_DFDN.DIM_WLT_ACCT A
+  LEFT JOIN DP_SDMT_DFDN.DIM_WLT_ACCT_USR AS C
+  ON A.WLT_USR_EDW_ID=C.WLT_USR_EDW_ID
+  LEFT JOIN DIM_CUST D 
+  ON D.IDNTFTN_VAL = C.GLOBL_ID and d.system_code in( 'OMI','cbs')
+  LEFT JOIN DP_sDMT_DFDN.DIM_ACCT_STS_SS DA ON DA.ACCT_STS_EDW_ID=a.ACCT_STS_EDW_ID
+  JOIN ENTITY_MAIN_ACCT M
+  ON M.IDNTFTN_VAL = C.GLOBL_ID
+
+    ),
+
+    FACT_TRXNS AS (
+
+ SELECT 
+    R.ACCT_NO,
+    SUM(CASE WHEN A.CR_ACCT_EDW_ID = R.ACCT_NO THEN A.CR_TSACTN_AMT ELSE 0 END) AS CREDIT_AMT,
+    SUM(CASE WHEN A.DR_ACCT_EDW_ID = R.ACCT_NO THEN A.DR_TSACTN_AMT ELSE 0 END) AS DEBIT_AMT,
+    SUM(CASE WHEN A.CR_ACCT_EDW_ID = R.ACCT_NO THEN 1 ELSE 0 END) AS NO_OF_CREDITS,
+    SUM(CASE WHEN A.DR_ACCT_EDW_ID = R.ACCT_NO THEN 1 ELSE 0 END) AS NO_OF_DEBITS
+    FROM DP_SDMT_DFDN.FCT_WLT_ACCT_TSACTN A
+    JOIN (SELECT DISTINCT ACCT_NO 
+      FROM RB_RELATED_ACCTS 
+      WHERE system_code = 'OMI') R
+  ON (A.DR_ACCT_EDW_ID = R.ACCT_NO OR A.CR_ACCT_EDW_ID = R.ACCT_NO)
+  AND A.TSACTN_DT BETWEEN ADD_MONTHS(CURRENT_DATE - 1, -36) AND CURRENT_DATE - 1
+    GROUP BY R.ACCT_NO
+
+    ),
+
+
+    FINAL_OUTPUT AS (
+    SELECT 
+  CAST(RB.ACCT_NO AS VARCHAR(100)) AS ACCT_NO,
+  CAST(RB.CUSTOMER_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+  CAST(RB.ACCT_TITL AS VARCHAR(200)) AS ACCT_TITLE,
+  
+  'UNITED BANK LIMITED ' as institution_name, 
+  'UNILPKKA' as swift,
+  CASE WHEN RSTRNT_TYPE_EDW_ID IS NOT NULL 
+       THEN CAST('B' AS VARCHAR(5)) 
+       ELSE CAST(RB.ACCT_STATUS AS VARCHAR(50)) END AS ACCT_STATUS,
+  CAST(RB.ACCT_OPEN_DATE AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+  COALESCE(CAST(RB.ACCT_CLOSE_DATE AS VARCHAR(20)),'-') AS ACCT_CLOSE_DATE,
+  CAST(RB.BRANCH AS VARCHAR(50)) AS BRANCH,
+  CAST(RB.STATUS_CODE AS VARCHAR(100)) AS STATUS_CODE,
+  CAST(RB.CCY AS VARCHAR(10)) AS CCY,
+  CAST(Role_ AS VARCHAR(100)) AS "ROLE",
+  CAST(RB.SOURCE_OF_FUNDS AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+  CAST(RB.CNIC AS VARCHAR(30)) AS CNIC,
+  CAST(RB.MOBILE AS VARCHAR(30)) AS MOBILE,  
+  CAST(RB.MAILING_ADDRESS AS VARCHAR(200)) AS MAILING_ADDRESS,
+  CAST(RB.EMAIL_ADDRESS AS VARCHAR(100)) AS EMAIL_ADDRESS,
+  CAST(RB.PERMANENT_ADDRESS AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+  CAST(RB.Reason AS VARCHAR(50)) AS Reason,
+  COALESCE(FT.NO_OF_CREDITS,0) AS NO_OF_CREDITS,
+  COALESCE(FT.CREDIT_AMT,0) AS CREDIT_AMT,
+  COALESCE(FT.NO_OF_DEBITS,0) AS NO_OF_DEBITS,
+  COALESCE(FT.DEBIT_AMT,0) AS DEBIT_AMT,
+  CAST(RB.mothers_name AS VARCHAR(100)) AS mothers_name,
+  CAST(RB.ssn AS VARCHAR(30)) AS ssn,
+  CAST(RB.nationality1 AS VARCHAR(50)) AS nationality1,
+  CAST(RB.gender AS VARCHAR(10)) AS gender,
+  CAST(RB.first_name AS VARCHAR(50)) AS first_name,
+  CAST(RB.last_name AS VARCHAR(50)) AS last_name,
+  CAST(RB.to_country AS VARCHAR(50)) AS to_country,
+  CAST(RB.birthdate AS VARCHAR(20)) AS birthdate,
+  CAST(RB.tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+  CAST(RB.tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+  CAST(RB.tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+  CAST(RB.tph_number AS VARCHAR(30)) AS tph_number,
+  CAST(RB.address_type AS VARCHAR(20)) AS address_type,
+  CAST(RB.address AS VARCHAR(200)) AS address,
+  CAST(RB.customer_type_cd AS VARCHAR(200)) AS customer_type_cd,
+  CAST(RB.customer_type_desc AS VARCHAR(200)) AS customer_type_desc,
+  CAST(RB.country_code AS VARCHAR(10)) AS country_code,
+  CAST(RB.city AS VARCHAR(100)) AS city,
+  CAST(RB.state AS VARCHAR(100)) AS state,
+  CAST(RB.occupation AS VARCHAR(200)) AS occupation,
+  CAST(RB.NRRTV AS VARCHAR(200)) AS NRRTV,
+  CAST(RB.RSTRNT_TYPE_EDW_ID AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+    FROM RB_RELATED_ACCTS RB
+    LEFT JOIN FACT_TRXNS FT ON FT.ACCT_NO = RB.ACCT_NO  
+    WHERE RB.ACCT_NO <> '281436262'
+
+    )
+    SELECT * FROM FINAL_OUTPUT;
+
+    
+
+    
+    """
+
+    return q
+
+
+
+
+def get_individual_query2(account_number, transaction_id, from_date, to_date):
+	
+    
+    p_acct_no = str(account_number)
+    p_trxn_no = str(transaction_id)
+    p_date_from = str(from_date) 
+    p_date_to = str(to_date) 
+    
+
+    part_1 = rf"""with base as (SELECT FACT.* ,REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+    CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB' WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+    FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+    LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+    LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+    LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+    WHERE 1=1 
+    AND RVSL_SEQ_NUM IS NULL 
+    AND REVERAL_IND = 'N'
+    AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+    AND FACT.ACCT_SROGT_ID= '{p_acct_no}'"""
+    
+    part_2 = rf"""AND (CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, '{p_trxn_no}' , ',') 
+    RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )"""
+
+    part_3 = rf"""AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE({p_date_from} , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+    AND COALESCE({p_date_to}  , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+    ),
+    acct_calc as (
+    select
+    base.* ,
+    right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+    right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+    length(to_num) as to_len
+    from  base
+    ),
+
+    final_calc as (
+    select 
+    acct_calc.* ,
+    COALESCE(
+    case when ACCT_SROGT_ID = fri_9 then
+    CASE 
+    WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+    WHEN TO_LEN >= 15 THEN TO_12
+    ELSE TO_9
+    END
+    WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+    THEN FRI_9
+    WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+    IBAN_VAL,
+    BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+    FROM acct_calc 
+    ),
+
+    MAIN_FACT_CTE AS (
+    SELECT  DISTINCT 
+    final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+    TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+    CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+    ROW_NUMBER() OVER (
+    PARTITION BY FCT_COUNTER_PRTY_ACCT
+    ORDER BY TSACTN_AMT DESC ) AS RN
+    FROM  final_calc 
+    LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+    ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+    LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+    ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+    WHERE 1=1
+    qualify rn =1
+    ) ,
+
+    CT_PARTY_3_YEAR_AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+    ACCT_SROGT_ID
+    FROM (
+    select DISTINCT
+    CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+    CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+    from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+    inner join main_fact_cte mfc
+    on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+    WHERE  1 =1   
+    AND FT.RVSL_SEQ_NUM IS NULL 
+    AND FT.Reveral_IND = 'N'
+    and mfc.FCT_COUNTER_PRTY_ACCT is not null
+    and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+    and coalesce({p_date_to} , cast(CURRENT_DATE-1 as varchar(15)) )
+    )  A
+    group by ACCT_SROGT_ID 
+                    ) ,
+    final_output as (
+
+    SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+    -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_country,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+    WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+    -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+    WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+    CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+    CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+    from   main_fact_CTE MAIN_FACT
+    LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+    on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    --- main client SUB QUERY
+    left join
+    ( 
+    WITH AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+    FROM (
+    select DISTINCT 
+    CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+    CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+    from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+    WHERE  1 =1   
+    AND ACCT_SROGT_ID=   '{p_acct_no}' -- '291808031' --: '329634296'  
+    AND RVSL_SEQ_NUM IS NULL 
+    AND Reveral_IND = 'N'
+    and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+    and coalesce({p_date_to} , cast(CURRENT_DATE-1 as varchar(15)) )
+    )  A
+    group by ACCT_SROGT_ID  										
+                    )
+    select 
+    'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+    b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+    b.Branch_Code as teller,
+    e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+    c.ACCT_SROGT_ID as account_ , C.IBAN_NUM , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+    case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+    d.GNDR as gender, d.TITL as title_  ,
+    -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+    CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+    ELSE 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+    END AS  Last_name,
+    case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+    CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+    case when d.MBL_NUM is not null then 'PAPVT' 
+    when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+    case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+    case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+    when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+    when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+    else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+    case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+    else substr(d.PHN_BUSN,2,12) end as tph_number,
+    case when d.PERM_ADDR is not null then 'PAPVT' 
+    when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+    case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+    d.CTRY_OF_NTLTY AS country_code, 
+    case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+    case
+    when FMC.STATE_LOC = 'NW' then 'KPK'
+    when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+    when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+    when FMC.STATE_LOC = 'SD' then 'SINDH'
+    when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+    when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+    when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+    END) AS state , 
+    case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+    else c.SRC_OTHR  end as Occupation, 
+    TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+    CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+    when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+    when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+    ELSE 'ASOTH' END AS STATUS_CODE,
+    i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+    from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+    inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+    inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+    inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+    inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+    left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+    where 1=1
+    and   c.ACCT_SROGT_ID =  '{p_acct_no}' 
+    ) MAIN_CLIENT 
+    ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+    ------ COUNTER PARTY 
+    left join
+    ( 
+    select 
+    'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+    b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+    e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+    c.ACCT_SROGT_ID as account_ , C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+    b.Branch_Code as teller,
+    case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+    d.GNDR as gender, d.TITL as title_  ,
+    -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+    CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+    ELSE 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+    END AS  Last_name,
+    case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+    CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+    case when d.MBL_NUM is not null then 'PAPVT' 
+    when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+    case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+    case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+    when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+    when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+    else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+    case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+    else substr(d.PHN_BUSN,2,12) end as tph_number,
+    case when d.PERM_ADDR is not null then 'PAPVT' 
+    when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+    case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+    d.CTRY_OF_NTLTY AS country_code, 
+    case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+    case
+    when FMC.STATE_LOC = 'NW' then 'KPK'
+    when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+    when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+    when FMC.STATE_LOC = 'SD' then 'SINDH'
+    when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+    when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+    when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+    END) AS state ,  
+    case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+    else c.SRC_OTHR  end as Occupation, 
+    TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+    CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+    when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+    when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+    ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+    from   MAIN_FACT_CTE MAIN_FACT 
+    inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+    inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+    inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+    inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+    --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+    where 1=1
+    ) CT_PART
+    ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    WHERE  1 =1  
+    and (ttmc_Account_ is not null and TFMC_account_ is not null )
+    /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+    and (TTMC_title is not null and TFMC_title is not null )
+    and (TTMC_state is not null and TFMC_state is not null )
+    and (TTMC_city is not null and TFMC_city is not null )*/
+    )
+    select main_Acc,
+    transactionnumber,
+    date_transaction,
+    authorized,
+    teller,
+    amount_local,
+    transmode_code,
+    to_funds_code,
+    from_funds_code,
+    CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+    CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+    CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+    CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+    CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+    CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+    CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+    CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+    CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+    CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+    CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+    CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+    CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+    CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+    CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+    CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+    CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+    CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+    CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+    CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+    CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+    CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+    CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+    CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+    CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+    CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+    CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+    CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+    CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+    CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+    CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+    CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+    CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+    CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+    CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+    CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+    CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+    CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+    CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+    CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+    CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+    CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+    CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+    CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+    CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+    CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+    CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+    CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+    CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+    CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+    CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+    CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+    CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+    CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+    CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+    CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+    CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+    CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+    CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+    CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+    CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+    CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+    CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+    CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+    CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+    CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+    CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+    CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+    CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+    CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+    from final_output"""
+    # print(p_trxn_no)
+    if p_trxn_no != '' or None:
+        # print("Trnx no found")
+        q = part_1 + part_2 + part_3
+    else:
+        q = part_1 + part_3
+
+    return q
+
+
+
+
+
+def get_wallet_query2(account_number):
+
+
+    q = rf"""
+    
+            WITH ENTITY_MAIN_ACCT AS (
+  SELECT 
+    C.ACCT_SROGT_ID,
+    C.ACCT_TITL,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+    OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+    D.IDNTFTN_VAL,
+    D.CUST_SROGT_ID,
+    CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+    CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+    C.SRC_OTHR,
+    C.SRC_OF_INCM,
+    C.SRC_OF_FUND
+  FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+    ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+   AND D.SYSTEM_CODE = 'CBS'
+  WHERE C.ACCT_SROGT_ID = '{account_number}' --'326247471'
+    ),
+
+    DIM_CUST AS ( 
+  SELECT *
+  FROM (
+    SELECT 
+      DC.CUST_SROGT_ID,
+      DC.IDNTFTN_VAL,
+	  C.CUST_TYPE_CD,
+      COALESCE(D.OCPTN_DESC, C.CUST_TYPE_DESC) AS OCCUPATION,
+      CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+      OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+      CASE 
+        WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+        WHEN NEW_MOBILE LIKE '+92%' THEN SUBSTR(NEW_MOBILE,4) 
+        WHEN NEW_MOBILE LIKE '3%' THEN '0'||NEW_MOBILE
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3)
+        ELSE NEW_MOBILE  
+      END AS MOBILE,
+      CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+      CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+      DC.SYSTEM_CODE,
+      CAST(DC.FTHR_NAME AS VARCHAR(100)) AS mothers_name, 
+      DC.IDNTFTN_VAL AS ssn, 
+      DC.CTRY_OF_NTLTY AS nationality1,
+      DC.GNDR AS gender,
+      CAST(TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+           FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) AS VARCHAR(50)) AS first_name,
+      CAST(CASE 
+        WHEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) = '' 
+        THEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) 
+        ELSE TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) 
+      END AS VARCHAR(50)) AS last_name,
+      DC.CUST_TYPE_EDW_ID,
+      DC.CTRY_OF_NTLTY AS to_country,
+      DC.CUST_SROGT_ID AS CUST_NUM, 
+      CAST(DC.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+      CASE 
+        WHEN DC.MBL_NUM IS NOT NULL AND (SUBSTR(DC.MBL_NUM,0,2)='92' OR SUBSTR(DC.MBL_NUM,1,3)='92') THEN '92'
+        WHEN LENGTH(SUBSTR(DC.MBL_NUM,2,12))=10 OR LENGTH(SUBSTR(DC.MBL_NUM,3,13))=10 THEN '92'
+        WHEN DC.CTRY_OF_NTLTY='PK' THEN '92'
+        ELSE SUBSTR(DC.MBL_NUM,0,2) 
+      END AS tph_country_prefix,
+      COALESCE(REGEXP_SUBSTR(DC.MBL_NUM,'3.*'), SUBSTR(DC.PHN_BUSN,2,12)) AS tph_number,
+      CASE WHEN DC.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+      CAST(COALESCE(DC.MLG_ADDR, DC.PERM_ADDR) AS VARCHAR(200)) AS address,
+      DC.CTRY_OF_NTLTY AS country_code,
+      C.CUST_TYPE_DESC,
+      CAST(CASE 
+        WHEN DC.RSDNTL_CITY='0' OR DC.RSDNTL_CITY IS NULL 
+        THEN TRIM(REGEXP_SUBSTR(FMC.location,'[A-Z a-z]+')) 
+        ELSE DC.RSDNTL_CITY 
+      END AS VARCHAR(100)) AS city,
+      CAST(COALESCE(DC.RGN_NAME,
+          CASE FMC.STATE_LOC
+              WHEN 'NW' THEN 'KPK'
+              WHEN 'AK' THEN 'AZAD KASHMIR'
+              WHEN 'PJ' THEN 'PUNJAB'
+              WHEN 'SD' THEN 'SINDH'
+              WHEN 'BL' THEN 'BALOCHISTAN'
+              WHEN 'IS' THEN 'ISLAMABAD'
+              WHEN 'GB' THEN 'GILGIT-BALISTAN'
+              WHEN 'FA' THEN 'GILGIT-BALISTAN'
+          END
+      ) AS VARCHAR(100)) AS state,             
+      ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID,DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC
+    LEFT JOIN dp_wrk_cbs.fm_client_daily FMC ON DC.CUST_SROGT_ID = FMC.client_no 
+    LEFT JOIN DP_sDMT_DFDN.DIM_OCPTN D ON D.OCPTN_EDW_ID = DC.OCPTN_EDW_ID AND D.OCPTN_CD IS NOT NULL
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS'
+    LEFT JOIN ENTITY_MAIN_ACCT EM1 ON DC.IDNTFTN_VAL = EM1.IDNTFTN_VAL
+    LEFT JOIN ENTITY_MAIN_ACCT EM2 ON OREPLACE(COALESCE(DC.MBL_NUM,DC.PHN_BUSN,DC.PHN_RSDNC),'[^0-9]') = EM2.MOBILE
+    LEFT JOIN ENTITY_MAIN_ACCT EM3 ON DC.PERM_ADDR = EM3.PERM_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM4 ON DC.MLG_ADDR = EM4.MLG_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM5 ON DC.E_ML_ADDR = EM5.E_ML_ADDR
+    WHERE DC.SYSTEM_CODE <> 'OMI'
+      AND (EM1.IDNTFTN_VAL IS NOT NULL OR EM2.MOBILE IS NOT NULL 
+           OR EM3.PERM_ADDR IS NOT NULL OR EM4.MLG_ADDR IS NOT NULL OR EM5.E_ML_ADDR IS NOT NULL)
+  ) Q
+  WHERE RN = 1
+    ),
+    RB_RELATED_ACCTS AS (
+
+    SELECT DISTINCT CAST(WLT_ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_NO, 
+  CAST(A.WLT_USR_EDW_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+  CAST(A.ACCT_TITL AS VARCHAR(100)) AS ACCT_TITL,
+    CAST(TO_CHAR(A.CRTD_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+	CAST(CASE WHEN A.ACCT_STS_EDW_ID = '2' THEN 'ACTIVE' 
+	when A.ACCT_STS_EDW_ID in ('10','3','4') THEN 'BLOCKED'
+	ELSE 'INACTIVE' END AS VARCHAR(50)) AS ACCT_STATUS,
+	'' AS ACCT_CLOSE_DATE,
+    'UBL Omni' AS BRANCH,
+    'PKR' AS CCY,
+	'' AS ROLE_,
+	'' AS STATUS_CODE,
+	CAST(d.OCCUPATION AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+	CAST(C.GLOBL_ID AS VARCHAR(30)) AS CNIC,
+	CAST(A.MBL_NUM AS VARCHAR(30)) AS MOBILE,  
+	 CAST(C.ML_ADDR AS VARCHAR(200)) AS MAILING_ADDRESS,
+	CAST(C.EML_ADDR AS VARCHAR(100)) AS EMAIL_ADDRESS,
+	CAST(D.PERM_ADDR AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+	'OMI' AS SYSTEM_CODE,
+	CAST('CNIC Matched' AS VARCHAR(50)) AS Reason,
+    CAST(mothers_name AS VARCHAR(100)) AS mothers_name,
+    CAST(ssn AS VARCHAR(30)) AS ssn,
+    CAST(nationality1 AS VARCHAR(50)) AS nationality1,
+	CAST(gender AS VARCHAR(10)) AS gender,
+    CAST(first_name AS VARCHAR(50)) AS first_name,
+    CAST(last_name AS VARCHAR(50)) AS last_name,
+    CAST(to_country AS VARCHAR(50)) AS to_country,
+    CAST(birthdate AS VARCHAR(20)) AS birthdate,
+    CAST(tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+    CAST(tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+    CAST(tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+    CAST(tph_number AS VARCHAR(30)) AS tph_number,
+    CAST(address_type AS VARCHAR(20)) AS address_type,
+    CAST(D.address AS VARCHAR(200)) AS address,
+	CAST(d.CUST_TYPE_CD AS VARCHAR(200)) AS customer_type_cd,
+	CAST(d.CUST_TYPE_DESC AS VARCHAR(200)) AS customer_type_desc,
+    CAST(country_code AS VARCHAR(10)) AS country_code,
+    CAST(D.city AS VARCHAR(100)) AS city,
+    CAST(state AS VARCHAR(100)) AS state,
+    CAST(d.OCCUPATION AS VARCHAR(200)) AS occupation,
+    CAST('' AS VARCHAR(200)) AS NRRTV,
+    CAST('' AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+  FROM DP_SDMT_DFDN.DIM_WLT_ACCT A
+  LEFT JOIN DP_SDMT_DFDN.DIM_WLT_ACCT_USR AS C
+  ON A.WLT_USR_EDW_ID=C.WLT_USR_EDW_ID
+  LEFT JOIN DIM_CUST D 
+  ON D.IDNTFTN_VAL = C.GLOBL_ID and d.system_code in( 'OMI','cbs')
+  LEFT JOIN DP_sDMT_DFDN.DIM_ACCT_STS_SS DA ON DA.ACCT_STS_EDW_ID=a.ACCT_STS_EDW_ID
+  JOIN ENTITY_MAIN_ACCT M
+  ON M.IDNTFTN_VAL = C.GLOBL_ID
+
+    ),
+
+    FACT_TRXNS AS (
+
+ SELECT 
+    R.ACCT_NO,
+    SUM(CASE WHEN A.CR_ACCT_EDW_ID = R.ACCT_NO THEN A.CR_TSACTN_AMT ELSE 0 END) AS CREDIT_AMT,
+    SUM(CASE WHEN A.DR_ACCT_EDW_ID = R.ACCT_NO THEN A.DR_TSACTN_AMT ELSE 0 END) AS DEBIT_AMT,
+    SUM(CASE WHEN A.CR_ACCT_EDW_ID = R.ACCT_NO THEN 1 ELSE 0 END) AS NO_OF_CREDITS,
+    SUM(CASE WHEN A.DR_ACCT_EDW_ID = R.ACCT_NO THEN 1 ELSE 0 END) AS NO_OF_DEBITS
+    FROM DP_SDMT_DFDN.FCT_WLT_ACCT_TSACTN A
+    JOIN (SELECT DISTINCT ACCT_NO 
+      FROM RB_RELATED_ACCTS 
+      WHERE system_code = 'OMI') R
+  ON (A.DR_ACCT_EDW_ID = R.ACCT_NO OR A.CR_ACCT_EDW_ID = R.ACCT_NO)
+  AND A.TSACTN_DT BETWEEN ADD_MONTHS(CURRENT_DATE - 1, -36) AND CURRENT_DATE - 1
+    GROUP BY R.ACCT_NO
+
+    ),
+
+
+    FINAL_OUTPUT AS (
+    SELECT 
+  CAST(RB.ACCT_NO AS VARCHAR(100)) AS ACCT_NO,
+  CAST(RB.CUSTOMER_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+  CAST(RB.ACCT_TITL AS VARCHAR(200)) AS ACCT_TITLE,
+  
+  'UNITED BANK LIMITED ' as institution_name, 
+  'UNILPKKA' as swift,
+  CASE WHEN RSTRNT_TYPE_EDW_ID IS NOT NULL 
+       THEN CAST('B' AS VARCHAR(5)) 
+       ELSE CAST(RB.ACCT_STATUS AS VARCHAR(50)) END AS ACCT_STATUS,
+  CAST(RB.ACCT_OPEN_DATE AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+  COALESCE(CAST(RB.ACCT_CLOSE_DATE AS VARCHAR(20)),'-') AS ACCT_CLOSE_DATE,
+  CAST(RB.BRANCH AS VARCHAR(50)) AS BRANCH,
+  CAST(RB.STATUS_CODE AS VARCHAR(100)) AS STATUS_CODE,
+  CAST(RB.CCY AS VARCHAR(10)) AS CCY,
+  CAST(Role_ AS VARCHAR(100)) AS "ROLE",
+  CAST(RB.SOURCE_OF_FUNDS AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+  CAST(RB.CNIC AS VARCHAR(30)) AS CNIC,
+  CAST(RB.MOBILE AS VARCHAR(30)) AS MOBILE,  
+  CAST(RB.MAILING_ADDRESS AS VARCHAR(200)) AS MAILING_ADDRESS,
+  CAST(RB.EMAIL_ADDRESS AS VARCHAR(100)) AS EMAIL_ADDRESS,
+  CAST(RB.PERMANENT_ADDRESS AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+  CAST(RB.Reason AS VARCHAR(50)) AS Reason,
+  COALESCE(FT.NO_OF_CREDITS,0) AS NO_OF_CREDITS,
+  COALESCE(FT.CREDIT_AMT,0) AS CREDIT_AMT,
+  COALESCE(FT.NO_OF_DEBITS,0) AS NO_OF_DEBITS,
+  COALESCE(FT.DEBIT_AMT,0) AS DEBIT_AMT,
+  CAST(RB.mothers_name AS VARCHAR(100)) AS mothers_name,
+  CAST(RB.ssn AS VARCHAR(30)) AS ssn,
+  CAST(RB.nationality1 AS VARCHAR(50)) AS nationality1,
+  CAST(RB.gender AS VARCHAR(10)) AS gender,
+  CAST(RB.first_name AS VARCHAR(50)) AS first_name,
+  CAST(RB.last_name AS VARCHAR(50)) AS last_name,
+  CAST(RB.to_country AS VARCHAR(50)) AS to_country,
+  CAST(RB.birthdate AS VARCHAR(20)) AS birthdate,
+  CAST(RB.tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+  CAST(RB.tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+  CAST(RB.tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+  CAST(RB.tph_number AS VARCHAR(30)) AS tph_number,
+  CAST(RB.address_type AS VARCHAR(20)) AS address_type,
+  CAST(RB.address AS VARCHAR(200)) AS address,
+  CAST(RB.customer_type_cd AS VARCHAR(200)) AS customer_type_cd,
+  CAST(RB.customer_type_desc AS VARCHAR(200)) AS customer_type_desc,
+  CAST(RB.country_code AS VARCHAR(10)) AS country_code,
+  CAST(RB.city AS VARCHAR(100)) AS city,
+  CAST(RB.state AS VARCHAR(100)) AS state,
+  CAST(RB.occupation AS VARCHAR(200)) AS occupation,
+  CAST(RB.NRRTV AS VARCHAR(200)) AS NRRTV,
+  CAST(RB.RSTRNT_TYPE_EDW_ID AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+    FROM RB_RELATED_ACCTS RB
+    LEFT JOIN FACT_TRXNS FT ON FT.ACCT_NO = RB.ACCT_NO  
+    WHERE RB.ACCT_NO <> '{account_number}'
+
+    )
+    SELECT * FROM FINAL_OUTPUT;
+
+    
+
+    
+    """
+
+    return q
+
+
+
+
+def get_entity_query2(account_number):
+    q = rf"""
+    WITH ENTITY_MAIN_ACCT AS ( 
+    SELECT  
+        C.ACCT_SROGT_ID, 
+        C.ACCT_TITL, 
+        CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+        D.IDNTFTN_VAL, 
+        D.CUST_SROGT_ID, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS MLG_ADDR
+    FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+    INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+       AND D.SYSTEM_CODE = 'CBS' 
+    WHERE C.ACCT_SROGT_ID = '{account_number}'
+    ), 
+
+    DIM_CUST AS ( 
+    SELECT  
+        DC.CUST_SROGT_ID, 
+        DC.IDNTFTN_VAL, 
+        CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+        CASE 
+            WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+            WHEN NEW_MOBILE LIKE '+92%'  THEN SUBSTR(NEW_MOBILE,4) 
+            WHEN NEW_MOBILE LIKE '3%'    THEN '0'||NEW_MOBILE 
+            WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+            WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3) 
+            ELSE NEW_MOBILE 
+        END AS MOBILE, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS MLG_ADDR, 
+        DC.SYSTEM_CODE, 
+        DC.CUST_TYPE_EDW_ID, 
+        C.CUST_TYPE_DESC,  
+        C.CUST_TYPE_CD,
+        ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID, DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN 
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC 
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C 
+        ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS' 
+    INNER JOIN ENTITY_MAIN_ACCT EM 
+    ON (
+        COALESCE(DC.PERM_ADDR, 'abc') = COALESCE(EM.PERM_ADDR, 'abc')
+        OR COALESCE(
+             OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]'),
+             '123'
+           ) = COALESCE(NULLIF(EM.MOBILE,''), 'x12x')
+        OR COALESCE(DC.IDNTFTN_VAL, 'abc') = COALESCE(EM.IDNTFTN_VAL, 'abc')
+        OR COALESCE(DC.MLG_ADDR, 'abc') = COALESCE(EM.MLG_ADDR, 'abc')
+        OR COALESCE(DC.E_ML_ADDR, 'abc') = COALESCE(EM.E_ML_ADDR, 'abc')
+    )
+    WHERE DC.SYSTEM_CODE = 'CBS'
+    ),
+    RB_RELATED_ACCTS AS ( 
+    SELECT DISTINCT 
+        C.ACCT_SROGT_ID  AS ACCT_NO 
+    FROM ENTITY_MAIN_ACCT EM
+    INNER JOIN DIM_CUST D ON D.SYSTEM_CODE = 'CBS'
+    LEFT JOIN DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+    WHERE 1=1
+	AND D.CUST_TYPE_CD IN ('03','31','32','33','34','35','36','37','38')
+	and C.ACCT_SROGT_ID  <>  '{account_number}'
+    )
+    ,
+
+    CLEAN_NAME AS (
+    SELECT 
+        REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') AS NAME_CLEAN,
+        D.*
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW D
+    ),
+    DIM_CUST_VW AS (
+    SELECT  
+        D.CUST_SROGT_ID,
+        D.FTHR_NAME AS mothers_name, 
+        D.IDNTFTN_VAL AS ssn, 
+        D.CTRY_OF_NTLTY AS nationality1,
+        D.GNDR AS gender,
+        TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1)) AS first_name,
+        CASE 
+            WHEN TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1)) = '' 
+            THEN TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1))
+            ELSE TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1))
+        END AS last_name,
+        D.CUST_TYPE_EDW_ID,
+        D.CTRY_OF_NTLTY AS to_country,  
+        D.CUST_SROGT_ID AS CUST_NUM, 
+        CAST(D.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+        CASE WHEN D.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+        CASE WHEN D.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+        CASE 
+            WHEN D.MBL_NUM IS NOT NULL AND (SUBSTR(D.MBL_NUM,0,2) = '92' OR SUBSTR(D.MBL_NUM,1,3) = '92') THEN '92'
+            WHEN LENGTH(SUBSTR(D.MBL_NUM,2,12)) = 10 OR LENGTH(SUBSTR(D.MBL_NUM,3,13)) = 10 THEN '92'
+            WHEN D.CTRY_OF_NTLTY = 'PK' THEN '92'
+            ELSE SUBSTR(D.MBL_NUM,0,2) 
+        END AS tph_country_prefix,
+        COALESCE(REGEXP_SUBSTR(D.MBL_NUM,'3.*'), SUBSTR(D.PHN_BUSN,2,12)) AS tph_number,
+        CASE WHEN D.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+        COALESCE(D.MLG_ADDR, D.PERM_ADDR) AS address,
+        D.CTRY_OF_NTLTY AS country_code, 
+        CASE 
+            WHEN D.RSDNTL_CITY = '0' OR D.RSDNTL_CITY IS NULL 
+            THEN TRIM(REGEXP_SUBSTR(location,'[A-Z a-z]+')) 
+            ELSE D.RSDNTL_CITY 
+        END AS city,
+        COALESCE(D.RGN_NAME,
+            CASE FMC.STATE_LOC
+                WHEN 'NW' THEN 'KPK'
+                WHEN 'AK' THEN 'AZAD KASHMIR'
+                WHEN 'PJ' THEN 'PUNJAB'
+                WHEN 'SD' THEN 'SINDH'
+                WHEN 'BL' THEN 'BALOCHISTAN'
+                WHEN 'IS' THEN 'ISLAMABAD'
+                WHEN 'GB' THEN 'GILGIT-BALISTAN'
+                WHEN 'FA' THEN 'GILGIT-BALISTAN'
+            END
+        ) AS state,
+        'UNITED BANK LIMITED' AS institution_name,  
+        'UNILPKKA' AS swift, 
+        'PK' AS institution_country,
+        'ETPVT' AS incorporation_legal_form,
+		e.CUST_TYPE_CD as CUST_TYPE_CD,
+		e.CUST_TYPE_DESC as CUST_TYPE_DESC
+    FROM CLEAN_NAME D
+    INNER JOIN dp_wrk_cbs.fm_client_daily FMC ON D.CUST_SROGT_ID = FMC.client_no AND D.system_code = 'CBS'
+    INNER JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS E ON E.CUST_TYPE_EDW_ID = D.CUST_TYPE_EDW_ID
+    )
+    -- Mandate Client
+    SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+    'MANDATE_CLIENT' AS TYP, MA.CLIENT_NO, 'ARPYS' AS ROLE_OUTER,    dc.CUST_SROGT_ID,
+       dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+       dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+       dc.address,       dc.country_code,       dc.city,       dc.state,
+       dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+	       b.BRNCH_DESC AS branch, 
+        COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+        b.Branch_Code AS teller,
+        DIM_ACCT.ACCT_SROGT_ID AS account_, 
+        DIM_ACCT.IBAN_NUM, 
+        DIM_ACCT.CURY_EDW_ID AS currency_code,
+        DIM_ACCT.ACCT_TITL AS account_name,
+        DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+        DIM_ACCT.SRC_OF_FUND AS business, 
+        CASE 
+            WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+            WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+            WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+            ELSE 'ARCTA' 
+        END AS Role_, 
+        CASE 
+            WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+            WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+            WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+        END AS account_type,
+        TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+        CASE 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+            ELSE 'ASOTH' 
+        END AS STATUS_CODE
+    FROM DIM_CUST_VW DC
+    LEFT JOIN DP_REPORTING_MART.TM_DM_MD_MANDATE_AUTHORIZE MA ON DC.CUST_SROGT_ID = MA.CLIENT_NO   AND CAST(MA.START_DATE AS DATE) = CURRENT_DATE - 1 
+    INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.ACCT_SROGT_ID = MA.ACCT_NO
+    LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+    INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+
+    --WHERE DIM_ACCT.ACCT_SROGT_ID = '323477174'
+
+    UNION ALL
+
+    -- Director Client
+    SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'DIRECTOR_CLIENT' AS TYP, DRC.CLIENT_NO, 'ARPYS' AS ROLE_OUTER,     dc.CUST_SROGT_ID,
+       dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+       dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+       dc.address,       dc.country_code,       dc.city,       dc.state,
+       dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+	       b.BRNCH_DESC AS branch, 
+        COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+        b.Branch_Code AS teller,
+        DIM_ACCT.ACCT_SROGT_ID AS account_, 
+        DIM_ACCT.IBAN_NUM, 
+        DIM_ACCT.CURY_EDW_ID AS currency_code,
+        DIM_ACCT.ACCT_TITL AS account_name,
+        DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+        DIM_ACCT.SRC_OF_FUND AS business, 
+        CASE 
+            WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+            WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+            WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+            ELSE 'ARCTA' 
+        END AS Role_, 
+        CASE 
+            WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+            WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+            WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+        END AS account_type,
+        TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+        CASE 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+            ELSE 'ASOTH' 
+        END AS STATUS_CODE
+    FROM DIM_CUST_VW DC
+    INNER JOIN DP_REPORTING_MART.FM_DIRECTOR_DTLS DRC ON DC.CUST_SROGT_ID = DRC.CLIENT_NO_DIR AND CAST(DRC.START_DATE AS DATE) = CURRENT_DATE - 1 
+    INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DRC.CLIENT_NO
+    LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+    INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+
+    UNION ALL
+
+    -- Main Client
+    SELECT DISTINCT  DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'MAIN_CLIENT' AS TYP, CAST(DC.CUST_NUM AS VARCHAR(100)) AS CLIENT_NO,
+       CAST('' AS VARCHAR(100)) AS ROLE_OUTER,    dc.CUST_SROGT_ID,
+       dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+       dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+       dc.address,       dc.country_code,       dc.city,       dc.state,
+       dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+	       b.BRNCH_DESC AS branch, 
+        COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+        b.Branch_Code AS teller,
+        DIM_ACCT.ACCT_SROGT_ID AS account_, 
+        DIM_ACCT.IBAN_NUM, 
+        DIM_ACCT.CURY_EDW_ID AS currency_code,
+        DIM_ACCT.ACCT_TITL AS account_name,
+        DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+        DIM_ACCT.SRC_OF_FUND AS business, 
+        CASE 
+            WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+            WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+            WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+            ELSE 'ARCTA' 
+        END AS Role_, 
+        CASE 
+            WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+            WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+            WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+        END AS account_type,
+        TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+        CASE 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+            WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+            ELSE 'ASOTH' 
+        END AS STATUS_CODE
+        FROM DIM_CUST_VW DC
+    INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DC.CUST_SROGT_ID
+    LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+    INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+
+
+
+
+
+    """
+    return q
+
+
+
+
+
+def get_cbs_cc_query2(account_number):
+    q = rf"""
+    WITH ENTITY_MAIN_ACCT AS (
+  SELECT 
+    C.ACCT_SROGT_ID,
+    C.ACCT_TITL,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+    OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+    D.IDNTFTN_VAL,
+    D.CUST_SROGT_ID,
+    CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+    CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+    C.SRC_OTHR,
+    C.SRC_OF_INCM,
+    C.SRC_OF_FUND
+  FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+    ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+   AND D.SYSTEM_CODE = 'CBS'
+  WHERE C.ACCT_SROGT_ID = '{account_number}' --'326247471'
+    ),
+
+    DIM_CUST AS (
+  SELECT *
+  FROM (
+    SELECT 
+      DC.CUST_SROGT_ID,
+      DC.IDNTFTN_VAL,
+	  C.CUST_TYPE_CD,
+      COALESCE(D.OCPTN_DESC, C.CUST_TYPE_DESC) AS OCCUPATION,
+      CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+      OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+      CASE 
+        WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+        WHEN NEW_MOBILE LIKE '+92%' THEN SUBSTR(NEW_MOBILE,4) 
+        WHEN NEW_MOBILE LIKE '3%' THEN '0'||NEW_MOBILE
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+        WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3)
+        ELSE NEW_MOBILE  
+      END AS MOBILE,
+      CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS PERM_ADDR,
+      CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''),'\s{2,}','') AS VARCHAR(200)) AS MLG_ADDR,
+      DC.SYSTEM_CODE,
+      CAST(DC.FTHR_NAME AS VARCHAR(100)) AS mothers_name, 
+      DC.IDNTFTN_VAL AS ssn, 
+      DC.CTRY_OF_NTLTY AS nationality1,
+      DC.GNDR AS gender,
+      CAST(TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+           FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) AS VARCHAR(50)) AS first_name,
+      CAST(CASE 
+        WHEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) = '' 
+        THEN TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM 1 FOR POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')-1)) 
+        ELSE TRIM(SUBSTRING(REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') 
+             FROM POSITION(' ' IN REGEXP_REPLACE(DC.CUST_NAME,'^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i')||' ')+1)) 
+      END AS VARCHAR(50)) AS last_name,
+      DC.CUST_TYPE_EDW_ID,
+      DC.CTRY_OF_NTLTY AS to_country,
+      DC.CUST_SROGT_ID AS CUST_NUM, 
+      CAST(DC.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+      CASE WHEN DC.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+      CASE 
+        WHEN DC.MBL_NUM IS NOT NULL AND (SUBSTR(DC.MBL_NUM,0,2)='92' OR SUBSTR(DC.MBL_NUM,1,3)='92') THEN '92'
+        WHEN LENGTH(SUBSTR(DC.MBL_NUM,2,12))=10 OR LENGTH(SUBSTR(DC.MBL_NUM,3,13))=10 THEN '92'
+        WHEN DC.CTRY_OF_NTLTY='PK' THEN '92'
+        ELSE SUBSTR(DC.MBL_NUM,0,2) 
+      END AS tph_country_prefix,
+      COALESCE(REGEXP_SUBSTR(DC.MBL_NUM,'3.*'), SUBSTR(DC.PHN_BUSN,2,12)) AS tph_number,
+      CASE WHEN DC.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+      CAST(COALESCE(DC.MLG_ADDR, DC.PERM_ADDR) AS VARCHAR(200)) AS address,
+      DC.CTRY_OF_NTLTY AS country_code,
+      C.CUST_TYPE_DESC,
+      CAST(CASE 
+        WHEN DC.RSDNTL_CITY='0' OR DC.RSDNTL_CITY IS NULL 
+        THEN TRIM(REGEXP_SUBSTR(FMC.location,'[A-Z a-z]+')) 
+        ELSE DC.RSDNTL_CITY 
+      END AS VARCHAR(100)) AS city,
+      CAST(COALESCE(DC.RGN_NAME,
+          CASE FMC.STATE_LOC
+              WHEN 'NW' THEN 'KPK'
+              WHEN 'AK' THEN 'AZAD KASHMIR'
+              WHEN 'PJ' THEN 'PUNJAB'
+              WHEN 'SD' THEN 'SINDH'
+              WHEN 'BL' THEN 'BALOCHISTAN'
+              WHEN 'IS' THEN 'ISLAMABAD'
+              WHEN 'GB' THEN 'GILGIT-BALISTAN'
+              WHEN 'FA' THEN 'GILGIT-BALISTAN'
+          END
+      ) AS VARCHAR(100)) AS state,             
+      ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID,DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC
+    LEFT JOIN dp_wrk_cbs.fm_client_daily FMC ON DC.CUST_SROGT_ID = FMC.client_no 
+    LEFT JOIN DP_sDMT_DFDN.DIM_OCPTN D ON D.OCPTN_EDW_ID = DC.OCPTN_EDW_ID AND D.OCPTN_CD IS NOT NULL
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS'
+    LEFT JOIN ENTITY_MAIN_ACCT EM1 ON DC.IDNTFTN_VAL = EM1.IDNTFTN_VAL
+    LEFT JOIN ENTITY_MAIN_ACCT EM2 ON OREPLACE(COALESCE(DC.MBL_NUM,DC.PHN_BUSN,DC.PHN_RSDNC),'[^0-9]') = EM2.MOBILE
+    LEFT JOIN ENTITY_MAIN_ACCT EM3 ON DC.PERM_ADDR = EM3.PERM_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM4 ON DC.MLG_ADDR = EM4.MLG_ADDR
+    LEFT JOIN ENTITY_MAIN_ACCT EM5 ON DC.E_ML_ADDR = EM5.E_ML_ADDR
+    WHERE DC.SYSTEM_CODE <> 'OMI'
+      AND (EM1.IDNTFTN_VAL IS NOT NULL OR EM2.MOBILE IS NOT NULL 
+           OR EM3.PERM_ADDR IS NOT NULL OR EM4.MLG_ADDR IS NOT NULL OR EM5.E_ML_ADDR IS NOT NULL)
+  ) Q
+  WHERE RN = 1
+    ),
+    RB_RELATED_ACCTS AS (
+  SELECT DISTINCT 
+    CAST(C.ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_NO,
+	CAST(CUST_TYPE_CD AS VARCHAR (100)) AS CUST_TYPE_CD,
+	CAST(CUST_TYPE_DESC AS VARCHAR(100)) AS CUST_TYPE_DESC,
+    CAST(C.CUST_SROGT_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+    CAST(C.ACCT_TITL AS VARCHAR(200)) AS ACCT_TITLE,
+    CAST(TO_CHAR(C.ACCT_OPN_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+    CAST(DA.ACCT_STS_DESC AS VARCHAR(50)) AS ACCT_STATUS,
+    CAST(TO_CHAR(C.ACCT_CLS_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_CLOSE_DATE,
+    CAST(C.BRNCH_SROGT_ID AS VARCHAR(50)) AS BRANCH,
+    CAST(C.CURY_EDW_ID AS VARCHAR(10)) AS CCY,
+	
+	case when D.CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when C.JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when D.CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,
+
+    CASE WHEN C.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when C.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+				when C.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when C.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+				when C.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+				ELSE 'ASOTH' END AS STATUS_CODE,
+
+    CAST(TRIM(COALESCE(
+      CASE WHEN EM.SRC_OF_FUND IN ('1','2','3') THEN D.OCCUPATION ELSE OREPLACE(EM.SRC_OF_FUND,'_') END
+    ,'-')) AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+    CAST(D.IDNTFTN_VAL AS VARCHAR(30)) AS CNIC,
+    CAST(D.MOBILE AS VARCHAR(30)) AS MOBILE,  
+    CAST(D.MLG_ADDR AS VARCHAR(200)) AS MAILING_ADDRESS,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS EMAIL_ADDRESS,
+    CAST(D.PERM_ADDR AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+    CAST(D.SYSTEM_CODE AS VARCHAR(10)) AS SYSTEM_CODE,
+    CAST(CASE 
+      WHEN D.MOBILE = EM.MOBILE AND EM.MOBILE <> '' THEN 'Mobile Matched'
+      WHEN D.E_ML_ADDR = EM.E_ML_ADDR AND EM.E_ML_ADDR <> '' THEN 'Email Matched'
+      WHEN D.IDNTFTN_VAL = EM.IDNTFTN_VAL AND EM.IDNTFTN_VAL <> '' THEN 'CNIC Matched'
+      WHEN D.PERM_ADDR = EM.PERM_ADDR AND D.PERM_ADDR <> '' THEN 'Address Matched'
+    END AS VARCHAR(50)) AS Reason,
+    CAST(mothers_name AS VARCHAR(100)) AS mothers_name,
+    CAST(ssn AS VARCHAR(30)) AS ssn,
+    CAST(nationality1 AS VARCHAR(50)) AS nationality1,
+    CAST(gender AS VARCHAR(10)) AS gender,
+    CAST(first_name AS VARCHAR(50)) AS first_name,
+    CAST(last_name AS VARCHAR(50)) AS last_name,
+    CAST(to_country AS VARCHAR(50)) AS to_country,
+    CAST(birthdate AS VARCHAR(20)) AS birthdate,
+    CAST(tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+    CAST(tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+    CAST(tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+    CAST(tph_number AS VARCHAR(30)) AS tph_number,
+    CAST(address_type AS VARCHAR(20)) AS address_type,
+    CAST(D.address AS VARCHAR(200)) AS address,
+    CAST(country_code AS VARCHAR(10)) AS country_code,
+    CAST(city AS VARCHAR(100)) AS city,
+    CAST(state AS VARCHAR(100)) AS state,
+    CAST(COALESCE(
+      NULLIF(TRIM(EM.SRC_OTHR),''),
+      NULLIF(TRIM(EM.SRC_OF_INCM),''),
+      NULLIF(TRIM(EM.SRC_OF_FUND),''),
+      D.CUST_TYPE_DESC
+    ) AS VARCHAR(200)) AS occupation,
+    CAST(R.NRRTV AS VARCHAR(200)) AS NRRTV,
+    CAST(R.RSTRNT_TYPE_EDW_ID AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+  FROM ENTITY_MAIN_ACCT EM 
+  LEFT JOIN DIM_CUST D  
+    ON ((D.MOBILE = EM.MOBILE AND EM.MOBILE <> '') 
+     OR (D.E_ML_ADDR = EM.E_ML_ADDR AND EM.E_ML_ADDR <> '')
+     OR (D.IDNTFTN_VAL = EM.IDNTFTN_VAL AND EM.IDNTFTN_VAL <> '') 
+     OR (D.PERM_ADDR = EM.PERM_ADDR AND D.PERM_ADDR <> '')) 
+   AND D.SYSTEM_CODE = 'CBS'  
+  LEFT JOIN DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+    ON D.CUST_SROGT_ID = C.CUST_SROGT_ID AND D.SYSTEM_CODE = 'CBS'  
+  LEFT JOIN DP_sDMT_DFDN.DIM_ACCT_STS_SS DA 
+    ON DA.ACCT_STS_EDW_ID = C.ACCT_STS_EDW_ID AND DA.SYSTEM_CODE = 'CBS'
+  LEFT JOIN (
+    SELECT ACCT_SROGT_ID, NRRTV, RSTRNT_TYPE_EDW_ID
+    FROM (
+      SELECT ACCT_SROGT_ID, NRRTV, RSTRNT_STRT_DT, RSTRNT_TYPE_EDW_ID,
+             ROW_NUMBER() OVER(PARTITION BY ACCT_SROGT_ID ORDER BY RSTRNT_STRT_DT DESC) AS RN
+      FROM DP_SDMVW_DFDN.FCT_RTAIL_BNK_ACCT_RSTRNT_VW
+      WHERE RSTRNT_TYPE_EDW_ID = 'RFA'
+        AND RSTRNT_STS = 'A'
+        AND cast(BATCH_DT as date) = CURRENT_DATE-1
+    ) Q
+    WHERE RN=1
+  ) R ON C.ACCT_SROGT_ID = R.ACCT_SROGT_ID
+  --where  c.ACCT_SROGT_ID <> '{account_number}'
+
+  UNION ALL
+
+  SELECT DISTINCT
+    CAST(DC.CARD_NUM AS VARCHAR(100)) AS ACCT_NO,
+		'' AS CUST_TYPE_CD,
+	'' AS CUST_TYPE_DESC,
+    CAST(DC.CUST_SROGT_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+    CAST(DC.EMBS_NAME AS VARCHAR(200)) AS ACCT_TITL,
+    CAST(TO_CHAR(DC.CARD_CRTN_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+    CAST(DA.ACCT_STS_DESC AS VARCHAR(50)) AS ACCT_STATUS,
+    CAST(TO_CHAR(DC.CARD_CLSUR_DT,'MM/DD/YYYY') AS VARCHAR(20)) AS ACCT_CLOSE_DATE,
+    'UBL Credit Card' AS BRANCH,
+	    'PKR' AS CCY,
+    ' ' AS ROLE_,
+	'' AS STATUS_CODE,
+    CAST(D.OCCUPATION AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+    CAST(D.IDNTFTN_VAL AS VARCHAR(30)) AS CNIC,
+    CAST(D.MOBILE AS VARCHAR(30)) AS MOBILE,  
+    CAST(D.MLG_ADDR AS VARCHAR(200)) AS MAILING_ADDRESS,
+    CAST(D.E_ML_ADDR AS VARCHAR(100)) AS EMAIL_ADDRESS,
+    CAST(D.PERM_ADDR AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+    CAST(D.SYSTEM_CODE AS VARCHAR(10)) AS SYSTEM_CODE,
+    CAST('CNIC Matched' AS VARCHAR(50)) AS Reason,
+    CAST(mothers_name AS VARCHAR(100)) AS mothers_name,
+    CAST(ssn AS VARCHAR(30)) AS ssn,
+    CAST(nationality1 AS VARCHAR(50)) AS nationality1,
+    CAST(gender AS VARCHAR(10)) AS gender,
+    CAST(first_name AS VARCHAR(50)) AS first_name,
+    CAST(last_name AS VARCHAR(50)) AS last_name,
+    CAST(to_country AS VARCHAR(50)) AS to_country,
+    CAST(birthdate AS VARCHAR(20)) AS birthdate,
+    CAST(tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+    CAST(tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+    CAST(tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+    CAST(tph_number AS VARCHAR(30)) AS tph_number,
+    CAST(address_type AS VARCHAR(20)) AS address_type,
+    CAST(D.address AS VARCHAR(200)) AS address,
+    CAST(country_code AS VARCHAR(10)) AS country_code,
+    CAST(city AS VARCHAR(100)) AS city,
+    CAST(state AS VARCHAR(100)) AS state,
+    CAST('' AS VARCHAR(200)) AS occupation,
+    CAST('' AS VARCHAR(200)) AS NRRTV,
+    CAST('' AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+   FROM  DP_SDMT_DFDN.DIM_CARD_SS DC
+    LEFT JOIN DIM_CUST D ON D.CUST_sROGT_ID = DC.CUST_sROGT_ID AND D.SYSTEM_CODE = 'CTL'
+    LEFT JOIN DP_sDMT_DFDN.DIM_ACCT_STS_SS DA ON DA.ACCT_STS_EDW_ID = DC.CARD_STS_EDW_ID AND DA.SYSTEM_cODE = 'CTL'
+    WHERE DC.SYSTEM_CODE = 'CTL'
+    AND D.IDNTFTN_VAL IN (SELECT IDNTFTN_VAL FROM ENTITY_MAIN_ACCT)
+    ),
+
+    FACT_TRXNS AS (
+  SELECT 
+    CAST(ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_NO,
+    SUM(CREDIT_AMT) AS CREDIT_AMT,
+    SUM(DEBIT_AMT) AS DEBIT_AMT,
+    SUM(NO_OF_CREDITS) AS NO_OF_CREDITS,
+    SUM(NO_OF_DEBITS) AS NO_OF_DEBITS
+  FROM (
+    SELECT DISTINCT 
+      CAST(ACCT_SROGT_ID AS VARCHAR(100)) AS ACCT_SROGT_ID, 
+      TSACTN_ID,
+      CASE WHEN CR_DR_IND = 'C' AND SRC_TYP <> 'NI' THEN TSACTN_AMT ELSE 0 END AS CREDIT_AMT,
+      CASE WHEN CR_DR_IND = 'D' THEN TSACTN_AMT ELSE 0 END AS DEBIT_AMT,
+      CASE WHEN CR_DR_IND = 'C' AND SRC_TYP <> 'NI' THEN 1 ELSE 0 END AS NO_OF_CREDITS,
+      CASE WHEN CR_DR_IND = 'D' THEN 1 ELSE 0 END AS NO_OF_DEBITS
+    FROM DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW  
+    INNER JOIN RB_RELATED_ACCTS RB ON ACCT_SROGT_ID = RB.ACCT_NO
+    WHERE CAST(TSACTN_TMSTP AS DATE) BETWEEN ADD_MONTHS(CURRENT_DATE-1,-36) AND CURRENT_DATE-1
+      AND RVSL_SEQ_NUM IS NULL 
+      AND Reveral_IND = 'N'
+  ) A
+  GROUP BY ACCT_SROGT_ID
+
+  UNION ALL
+
+  SELECT 
+    CAST(ACCT_NO AS VARCHAR(100)) AS ACCT_NO,
+    SUM(CREDIT_AMT) AS CREDIT_AMT,
+    SUM(DEBIT_AMT) AS DEBIT_AMT,
+    SUM(NO_OF_CREDITS) AS NO_OF_CREDITS,
+    SUM(NO_OF_DEBITS) AS NO_OF_DEBITS
+  FROM (
+    SELECT 
+      CAST(FCT.CARD_NUM AS VARCHAR(100)) AS ACCT_NO,
+      CASE WHEN TSACTN_AMT > 0 THEN TSACTN_AMT ELSE 0 END AS CREDIT_AMT,
+      CASE WHEN TSACTN_AMT <= 0 THEN TSACTN_AMT * -1 ELSE 0 END AS DEBIT_AMT,
+      CASE WHEN TSACTN_AMT > 0 THEN 1 ELSE 0 END AS NO_OF_CREDITS,
+      CASE WHEN TSACTN_AMT <= 0 THEN 1 ELSE 0 END AS NO_OF_DEBITS                           
+    FROM DP_SDMT_DFDN.FCT_CR_CARD_TSACTN FCT
+    INNER JOIN RB_RELATED_ACCTS RB ON FCT.CARD_NUM = RB.ACCT_NO
+    WHERE CAST(TSACTN_DT AS DATE) BETWEEN ADD_MONTHS(CURRENT_DATE-1,-36) AND CURRENT_DATE-1
+  ) Q
+  GROUP BY ACCT_NO
+    ),
+
+
+    FINAL_OUTPUT AS (
+    SELECT 
+  CAST(RB.ACCT_NO AS VARCHAR(100)) AS ACCT_NO,
+  CAST(RB.CUSTOMER_ID AS VARCHAR(100)) AS CUSTOMER_ID,
+  CAST(RB.ACCT_TITLE AS VARCHAR(200)) AS ACCT_TITLE,
+  CAST(RB.CUST_TYPE_CD  AS VARCHAR(200)) AS CUSTOMER_TYPE_CODE,
+  CAST(RB.CUST_TYPE_DESC AS VARCHAR(200)) AS CUSTOMER_TYPE_DESC,
+  'UNITED BANK LIMITED ' as institution_name, 
+  'UNILPKKA' as swift,
+  CASE WHEN RSTRNT_TYPE_EDW_ID IS NOT NULL 
+       THEN CAST('B' AS VARCHAR(5)) 
+       ELSE CAST(RB.ACCT_STATUS AS VARCHAR(50)) END AS ACCT_STATUS,
+  CAST(RB.ACCT_OPEN_DATE AS VARCHAR(20)) AS ACCT_OPEN_DATE,
+  COALESCE(CAST(RB.ACCT_CLOSE_DATE AS VARCHAR(20)),'-') AS ACCT_CLOSE_DATE,
+  CAST(RB.BRANCH AS VARCHAR(50)) AS BRANCH,
+  CAST(RB.STATUS_CODE AS VARCHAR(100)) AS STATUS_CODE,
+  CAST(RB.CCY AS VARCHAR(10)) AS CCY,
+  CAST(Role_ AS VARCHAR(100)) AS "ROLE",
+  CAST(RB.SOURCE_OF_FUNDS AS VARCHAR(200)) AS SOURCE_OF_FUNDS,
+  CAST(RB.CNIC AS VARCHAR(30)) AS CNIC,
+  CAST(RB.MOBILE AS VARCHAR(30)) AS MOBILE,  
+  CAST(RB.MAILING_ADDRESS AS VARCHAR(200)) AS MAILING_ADDRESS,
+  CAST(RB.EMAIL_ADDRESS AS VARCHAR(100)) AS EMAIL_ADDRESS,
+  CAST(RB.PERMANENT_ADDRESS AS VARCHAR(200)) AS PERMANENT_ADDRESS,
+  CAST(RB.Reason AS VARCHAR(50)) AS Reason,
+  COALESCE(FT.NO_OF_CREDITS,0) AS NO_OF_CREDITS,
+  COALESCE(FT.CREDIT_AMT,0) AS CREDIT_AMT,
+  COALESCE(FT.NO_OF_DEBITS,0) AS NO_OF_DEBITS,
+  COALESCE(FT.DEBIT_AMT,0) AS DEBIT_AMT,
+  CAST(RB.mothers_name AS VARCHAR(100)) AS mothers_name,
+  CAST(RB.ssn AS VARCHAR(30)) AS ssn,
+  CAST(RB.nationality1 AS VARCHAR(50)) AS nationality1,
+  CAST(RB.gender AS VARCHAR(10)) AS gender,
+  CAST(RB.first_name AS VARCHAR(50)) AS first_name,
+  CAST(RB.last_name AS VARCHAR(50)) AS last_name,
+  CAST(RB.to_country AS VARCHAR(50)) AS to_country,
+  CAST(RB.birthdate AS VARCHAR(20)) AS birthdate,
+  CAST(RB.tph_contact_type AS VARCHAR(20)) AS tph_contact_type,
+  CAST(RB.tph_communication_type AS VARCHAR(20)) AS tph_communication_type,
+  CAST(RB.tph_country_prefix AS VARCHAR(10)) AS tph_country_prefix,
+  CAST(RB.tph_number AS VARCHAR(30)) AS tph_number,
+  CAST(RB.address_type AS VARCHAR(20)) AS address_type,
+  CAST(RB.address AS VARCHAR(200)) AS address,
+  CAST(RB.country_code AS VARCHAR(10)) AS country_code,
+  CAST(RB.city AS VARCHAR(100)) AS city,
+  CAST(RB.state AS VARCHAR(100)) AS state,
+  CAST(RB.occupation AS VARCHAR(200)) AS occupation,
+  CAST(RB.NRRTV AS VARCHAR(200)) AS NRRTV,
+  CAST(RB.RSTRNT_TYPE_EDW_ID AS VARCHAR(50)) AS RSTRNT_TYPE_EDW_ID
+    FROM RB_RELATED_ACCTS RB
+    LEFT JOIN FACT_TRXNS FT ON FT.ACCT_NO = RB.ACCT_NO
+    --WHERE RB.ACCT_NO <> '{account_number}'
+
+    )
+    SELECT * FROM FINAL_OUTPUT
+    --where acct_no <> '{account_number}'
+
+   
+   
+   
+    """
+
+    return q
+
+
+def get_entity_query3(account_number):
+    
+  q = rf""" WITH ENTITY_MAIN_ACCT AS ( 
+    SELECT  
+        C.ACCT_SROGT_ID, 
+        C.ACCT_TITL, 
+        CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+        D.IDNTFTN_VAL, 
+        D.CUST_SROGT_ID, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS MLG_ADDR
+    FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+    INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+       AND D.SYSTEM_CODE = 'CBS' 
+    WHERE C.ACCT_SROGT_ID = '{account_number}'
+    ), 
+
+    DIM_CUST AS ( 
+      SELECT  
+          DC.CUST_SROGT_ID, 
+          DC.IDNTFTN_VAL, 
+          CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+          OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+          CASE 
+              WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+              WHEN NEW_MOBILE LIKE '+92%'  THEN SUBSTR(NEW_MOBILE,4) 
+              WHEN NEW_MOBILE LIKE '3%'    THEN '0'||NEW_MOBILE 
+              WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+              WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3) 
+              ELSE NEW_MOBILE 
+          END AS MOBILE, 
+          CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS PERM_ADDR,
+          CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''), '\s{2,}', '') AS VARCHAR(200)) AS MLG_ADDR, 
+          DC.SYSTEM_CODE, 
+          DC.CUST_TYPE_EDW_ID, 
+          C.CUST_TYPE_DESC,  
+          C.CUST_TYPE_CD,
+          ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID, DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN 
+      FROM DP_SDMVW_DFDN.DIM_CUST_VW DC 
+      LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C 
+          ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS' 
+    INNER JOIN ENTITY_MAIN_ACCT EM 
+      ON (
+          COALESCE(DC.PERM_ADDR, 'abc') = COALESCE(EM.PERM_ADDR, 'abc')
+          OR COALESCE(
+              OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]'),
+              '123'
+            ) = COALESCE(NULLIF(EM.MOBILE,''), 'x12x')
+          OR COALESCE(DC.IDNTFTN_VAL, 'abc') = COALESCE(EM.IDNTFTN_VAL, 'abc')
+          OR COALESCE(DC.MLG_ADDR, 'abc') = COALESCE(EM.MLG_ADDR, 'abc')
+          OR COALESCE(DC.E_ML_ADDR, 'abc') = COALESCE(EM.E_ML_ADDR, 'abc')
+      )
+      WHERE DC.SYSTEM_CODE = 'CBS'
+    ) ,
+
+    RB_RELATED_ACCTS AS ( 
+        SELECT DISTINCT 
+            C.ACCT_SROGT_ID  AS ACCT_NO 
+        FROM ENTITY_MAIN_ACCT EM
+        INNER JOIN DIM_CUST D ON D.SYSTEM_CODE = 'CBS'
+        LEFT JOIN DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+            ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+        WHERE 1=1
+      AND D.CUST_TYPE_CD IN ('03','31','32','33','34','35','36','37','38')
+      and C.ACCT_SROGT_ID  =  '{account_number}'
+    ) ,
+    AMOUNT AS (
+          SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+          FROM (
+    select DISTINCT 
+          CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+          CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+    from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW txn INNER JOIN RB_RELATED_ACCTS RRA
+    ON TXN.ACCT_SROGT_ID = RRA.ACCT_NO
+    WHERE  1 =1   
+    --AND ACCT_SROGT_ID=   '{account_number}'   -- '291808031' --: '{account_number}'  
+    AND RVSL_SEQ_NUM IS NULL 
+    AND Reveral_IND = 'N'
+    and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+              and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+      )  A
+      group by ACCT_SROGT_ID ) , 
+
+      CLEAN_NAME AS (
+        SELECT 
+            REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') AS NAME_CLEAN,
+            D.*
+        FROM DP_SDMVW_DFDN.DIM_CUST_VW D
+      ),
+      DIM_CUST_VW AS (
+        SELECT  
+            D.CUST_SROGT_ID,
+            D.FTHR_NAME AS mothers_name, 
+            D.IDNTFTN_VAL AS ssn, 
+            D.CTRY_OF_NTLTY AS nationality1,
+            D.GNDR AS gender,
+            TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1)) AS first_name,
+            CASE 
+                WHEN TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1)) = '' 
+                THEN TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1))
+                ELSE TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1))
+            END AS last_name,
+            D.CUST_TYPE_EDW_ID,
+            D.CTRY_OF_NTLTY AS to_country,  
+            D.CUST_SROGT_ID AS CUST_NUM, 
+            CAST(D.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+            CASE WHEN D.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+            CASE WHEN D.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+            CASE 
+                WHEN D.MBL_NUM IS NOT NULL AND (SUBSTR(D.MBL_NUM,0,2) = '92' OR SUBSTR(D.MBL_NUM,1,3) = '92') THEN '92'
+                WHEN LENGTH(SUBSTR(D.MBL_NUM,2,12)) = 10 OR LENGTH(SUBSTR(D.MBL_NUM,3,13)) = 10 THEN '92'
+                WHEN D.CTRY_OF_NTLTY = 'PK' THEN '92'
+                ELSE SUBSTR(D.MBL_NUM,0,2) 
+            END AS tph_country_prefix,
+            COALESCE(REGEXP_SUBSTR(D.MBL_NUM,'3.*'), SUBSTR(D.PHN_BUSN,2,12)) AS tph_number,
+            CASE WHEN D.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+            COALESCE(D.MLG_ADDR, D.PERM_ADDR) AS address,
+            D.CTRY_OF_NTLTY AS country_code, 
+            CASE 
+                WHEN D.RSDNTL_CITY = '0' OR D.RSDNTL_CITY IS NULL 
+                THEN TRIM(REGEXP_SUBSTR(location,'[A-Z a-z]+')) 
+                ELSE D.RSDNTL_CITY 
+            END AS city,
+            COALESCE(D.RGN_NAME,
+                CASE FMC.STATE_LOC
+                    WHEN 'NW' THEN 'KPK'
+                    WHEN 'AK' THEN 'AZAD KASHMIR'
+                    WHEN 'PJ' THEN 'PUNJAB'
+                    WHEN 'SD' THEN 'SINDH'
+                    WHEN 'BL' THEN 'BALOCHISTAN'
+                    WHEN 'IS' THEN 'ISLAMABAD'
+                    WHEN 'GB' THEN 'GILGIT-BALISTAN'
+                    WHEN 'FA' THEN 'GILGIT-BALISTAN'
+                END
+            ) AS state,
+            'UNITED BANK LIMITED' AS institution_name,  
+            'UNILPKKA' AS swift, 
+            'PK' AS institution_country,
+            'ETPVT' AS incorporation_legal_form,
+        e.CUST_TYPE_CD as CUST_TYPE_CD,
+        e.CUST_TYPE_DESC as CUST_TYPE_DESC
+        FROM CLEAN_NAME D
+        INNER JOIN dp_wrk_cbs.fm_client_daily FMC ON D.CUST_SROGT_ID = FMC.client_no AND D.system_code = 'CBS'
+        INNER JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS E ON E.CUST_TYPE_EDW_ID = D.CUST_TYPE_EDW_ID
+      )
+      -- Mandate Client
+      SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+          'MANDATE_CLIENT' AS TYP, MA.CLIENT_NO, 'ARPYS' AS ROLE_OUTER,    dc.CUST_SROGT_ID,
+          dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+          dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+          dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+          dc.address,       dc.country_code,       dc.city,       dc.state,
+          dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+            b.BRNCH_DESC AS branch, 
+            COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+            b.Branch_Code AS teller,
+            DIM_ACCT.ACCT_SROGT_ID AS account_, 
+            DIM_ACCT.IBAN_NUM, 
+            DIM_ACCT.CURY_EDW_ID AS currency_code,
+            DIM_ACCT.ACCT_TITL AS account_name,
+            DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+            DIM_ACCT.SRC_OF_FUND AS business, 
+            CASE 
+                WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                      '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+                WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+                WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+                ELSE 'ARCTA' 
+            END AS Role_, 
+            CASE 
+                WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+                WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+                WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+            END AS account_type,
+            TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+            CASE 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+                ELSE 'ASOTH' 
+            END AS STATUS_CODE,
+        i.Dr_amt as beneficiary_comment, i.cr_amt as comments
+      FROM DIM_CUST_VW DC
+      LEFT JOIN DP_REPORTING_MART.TM_DM_MD_MANDATE_AUTHORIZE MA ON DC.CUST_SROGT_ID = MA.CLIENT_NO   AND CAST(MA.START_DATE AS DATE) = CURRENT_DATE - 1 
+      INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.ACCT_SROGT_ID = MA.ACCT_NO
+      LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+      INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+      left join AMOUNT i on i.ACCT_SROGT_ID = RRA.ACCT_NO
+
+
+      UNION ALL
+
+      -- Director Client
+      SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+          'DIRECTOR_CLIENT' AS TYP, DRC.CLIENT_NO, 'ARPYS' AS ROLE_OUTER,     dc.CUST_SROGT_ID,
+          dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+          dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+          dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+          dc.address,       dc.country_code,       dc.city,       dc.state,
+          dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+            b.BRNCH_DESC AS branch, 
+            COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+            b.Branch_Code AS teller,
+            DIM_ACCT.ACCT_SROGT_ID AS account_, 
+            DIM_ACCT.IBAN_NUM, 
+            DIM_ACCT.CURY_EDW_ID AS currency_code,
+            DIM_ACCT.ACCT_TITL AS account_name,
+            DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+            DIM_ACCT.SRC_OF_FUND AS business, 
+            CASE 
+                WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                      '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+                WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+                WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+                ELSE 'ARCTA' 
+            END AS Role_, 
+            CASE 
+                WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+                WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+                WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+            END AS account_type,
+            TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+            CASE 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+                ELSE 'ASOTH' 
+            END AS STATUS_CODE,
+        i.Dr_amt as beneficiary_comment, i.cr_amt as comments
+      FROM DIM_CUST_VW DC
+      INNER JOIN DP_REPORTING_MART.FM_DIRECTOR_DTLS DRC ON DC.CUST_SROGT_ID = DRC.CLIENT_NO_DIR AND CAST(DRC.START_DATE AS DATE) = CURRENT_DATE - 1 
+      INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DRC.CLIENT_NO
+      LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+      INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+      left join AMOUNT i on i.ACCT_SROGT_ID = RRA.ACCT_NO
+
+      UNION ALL
+
+      -- Main Client
+        SELECT DISTINCT  DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+          'MAIN_CLIENT' AS TYP, CAST(DC.CUST_NUM AS VARCHAR(100)) AS CLIENT_NO,
+          CAST('' AS VARCHAR(100)) AS ROLE_OUTER,    dc.CUST_SROGT_ID,
+          dc.mothers_name,       dc.ssn,       dc.nationality1,       dc.gender,       dc.first_name,       dc.last_name,       dc.CUST_TYPE_CD,
+          dc.CUST_TYPE_DESC,       dc.to_country,       dc.CUST_NUM,       dc.birthdate,       dc.tph_contact_type,
+          dc.tph_communication_type,       dc.tph_country_prefix,       dc.tph_number,       dc.address_type,
+          dc.address,       dc.country_code,       dc.city,       dc.state,
+          dc.institution_name,       dc.swift,       dc.institution_country,      dc.incorporation_legal_form,
+            b.BRNCH_DESC AS branch, 
+            COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+            b.Branch_Code AS teller,
+            DIM_ACCT.ACCT_SROGT_ID AS account_, 
+            DIM_ACCT.IBAN_NUM, 
+            DIM_ACCT.CURY_EDW_ID AS currency_code,
+            DIM_ACCT.ACCT_TITL AS account_name,
+            DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+            DIM_ACCT.SRC_OF_FUND AS business, 
+            CASE 
+                WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                      '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+                WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+                WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+                ELSE 'ARCTA' 
+            END AS Role_, 
+            CASE 
+                WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+                WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+                WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+            END AS account_type,
+            TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+            CASE 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+                WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+                ELSE 'ASOTH' 
+            END AS STATUS_CODE,
+        i.Dr_amt as beneficiary_comment, i.cr_amt as comments
+        FROM DIM_CUST_VW DC
+        INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DC.CUST_SROGT_ID
+        LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+        INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+        left join AMOUNT i on i.ACCT_SROGT_ID = RRA.ACCT_NO
+
+
+
+
+    """
+
+  return q
+
+
+
+
+
+def get_individual_query2(account_number, transaction_id, from_date, to_date):
+	
+    
+    p_acct_no = str(account_number)
+    p_trxn_no = str(transaction_id)
+    p_date_from = str(from_date) 
+    p_date_to = str(to_date) 
+    
+
+    part_1 = rf"""with base as (SELECT FACT.* ,REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,
+    REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+    CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB' WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+    FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+    LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+    LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+    LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+    WHERE 1=1 
+    AND RVSL_SEQ_NUM IS NULL 
+    AND REVERAL_IND = 'N'
+    AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+    AND FACT.ACCT_SROGT_ID= '{p_acct_no}'"""
+    
+    part_2 = rf"""AND (CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, '{p_trxn_no}' , ',') 
+    RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )"""
+
+    part_3 = rf"""AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE({p_date_from} , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+    AND COALESCE({p_date_to}  , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+    ),
+    acct_calc as (
+    select
+    base.* ,
+    right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+    right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+    length(to_num) as to_len
+    from  base
+    ),
+
+    final_calc as (
+    select 
+    acct_calc.* ,
+    COALESCE(
+    case when ACCT_SROGT_ID = fri_9 then
+    CASE 
+    WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+    WHEN TO_LEN >= 15 THEN TO_12
+    ELSE TO_9
+    END
+    WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+    THEN FRI_9
+    WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+    IBAN_VAL,
+    BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+    FROM acct_calc 
+    ),
+
+    MAIN_FACT_CTE AS (
+    SELECT  DISTINCT 
+    final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+    TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+    CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+    ROW_NUMBER() OVER (
+    PARTITION BY FCT_COUNTER_PRTY_ACCT
+    ORDER BY TSACTN_AMT DESC ) AS RN
+    FROM  final_calc 
+    LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+    ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+    LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+    ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+    WHERE 1=1
+    qualify rn =1
+    ) ,
+
+    CT_PARTY_3_YEAR_AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+    ACCT_SROGT_ID
+    FROM (
+    select DISTINCT
+    CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+    CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+    from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+    inner join main_fact_cte mfc
+    on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+    WHERE  1 =1   
+    AND FT.RVSL_SEQ_NUM IS NULL 
+    AND FT.Reveral_IND = 'N'
+    and mfc.FCT_COUNTER_PRTY_ACCT is not null
+    and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+    and coalesce({p_date_to} , cast(CURRENT_DATE-1 as varchar(15)) )
+    )  A
+    group by ACCT_SROGT_ID 
+                    ) ,
+    final_output as (
+
+    SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+    -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_country,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+    WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+    CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+    WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+    -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+    WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+    CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+    CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+    WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+    CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+    WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+    from   main_fact_CTE MAIN_FACT
+    LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+    on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    --- main client SUB QUERY
+    left join
+    ( 
+    WITH AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+    FROM (
+    select DISTINCT 
+    CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+    CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+    from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+    WHERE  1 =1   
+    AND ACCT_SROGT_ID=   '{p_acct_no}' -- '291808031' --: '329634296'  
+    AND RVSL_SEQ_NUM IS NULL 
+    AND Reveral_IND = 'N'
+    and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+    and coalesce({p_date_to} , cast(CURRENT_DATE-1 as varchar(15)) )
+    )  A
+    group by ACCT_SROGT_ID  										
+                    )
+    select 
+    'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+    b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+    b.Branch_Code as teller,
+    e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+    c.ACCT_SROGT_ID as account_ , C.IBAN_NUM , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+    case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+    d.GNDR as gender, d.TITL as title_  ,
+    -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+    CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+    ELSE 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+    END AS  Last_name,
+    case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+    CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+    case when d.MBL_NUM is not null then 'PAPVT' 
+    when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+    case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+    case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+    when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+    when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+    else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+    case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+    else substr(d.PHN_BUSN,2,12) end as tph_number,
+    case when d.PERM_ADDR is not null then 'PAPVT' 
+    when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+    case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+    d.CTRY_OF_NTLTY AS country_code, 
+    case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+    case
+    when FMC.STATE_LOC = 'NW' then 'KPK'
+    when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+    when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+    when FMC.STATE_LOC = 'SD' then 'SINDH'
+    when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+    when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+    when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+    END) AS state , 
+    case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+    else c.SRC_OTHR  end as Occupation, 
+    TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+    CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+    when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+    when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+    ELSE 'ASOTH' END AS STATUS_CODE,
+    i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+    from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+    inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+    inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+    inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+    inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+    left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+    where 1=1
+    and   c.ACCT_SROGT_ID =  '{p_acct_no}' 
+    ) MAIN_CLIENT 
+    ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+    ------ COUNTER PARTY 
+    left join
+    ( 
+    select 
+    'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+    b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+    e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+    c.ACCT_SROGT_ID as account_ , C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+    b.Branch_Code as teller,
+    case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+    d.GNDR as gender, d.TITL as title_  ,
+    -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+    CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+    FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+    ELSE 
+    TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+    POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+    END AS  Last_name,
+    case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+    '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+    when JOIN_ACCT_FLG = '1' then 'ARJTA'
+    when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+    CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+    case when d.MBL_NUM is not null then 'PAPVT' 
+    when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+    case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+    case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+    when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+    when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+    else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+    case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+    else substr(d.PHN_BUSN,2,12) end as tph_number,
+    case when d.PERM_ADDR is not null then 'PAPVT' 
+    when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+    case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+    d.CTRY_OF_NTLTY AS country_code, 
+    case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+    case
+    when FMC.STATE_LOC = 'NW' then 'KPK'
+    when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+    when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+    when FMC.STATE_LOC = 'SD' then 'SINDH'
+    when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+    when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+    when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+    END) AS state ,  
+    case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+    else c.SRC_OTHR  end as Occupation, 
+    TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+    CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+    when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+    when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+    ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+    from   MAIN_FACT_CTE MAIN_FACT 
+    inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+    inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+    inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+    inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+    --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+    where 1=1
+    ) CT_PART
+    ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+    WHERE  1 =1  
+    and (ttmc_Account_ is not null and TFMC_account_ is not null )
+    /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+    and (TTMC_title is not null and TFMC_title is not null )
+    and (TTMC_state is not null and TFMC_state is not null )
+    and (TTMC_city is not null and TFMC_city is not null )*/
+    )
+    select main_Acc,
+    transactionnumber,
+    date_transaction,
+    authorized,
+    teller,
+    amount_local,
+    transmode_code,
+    to_funds_code,
+    from_funds_code,
+    CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+    CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+    CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+    CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+    CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+    CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+    CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+    CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+    CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+    CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+    CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+    CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+    CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+    CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+    CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+    CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+    CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+    CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+    CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+    CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+    CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+    CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+    CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+    CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+    CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+    CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+    CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+    CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+    CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+    CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+    CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+    CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+    CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+    CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+    CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+    CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+    CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+    CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+    CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+    CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+    CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+    CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+    CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+    CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+    CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+    CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+    CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+    CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+    CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+    CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+    CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+    CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+    CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+    CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+    CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+    CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+    CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+    CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+    CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+    CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+    CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+    CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+    CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+    CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+    CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+    CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+    CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+    CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+    CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+    CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+    from final_output"""
+    # print(p_trxn_no)
+    if p_trxn_no != '' or None:
+        # print("Trnx no found")
+        q = part_1 + part_2 + part_3
+    else:
+        q = part_1 + part_3
+
+    return q
+
+
+def get_transactions_query(account_number, transaction_id, from_date, to_date):
+  
+  p_acct_no = str(account_number)
+  p_trxn_no = str(transaction_id)
+  p_date_from = str(from_date) 
+  p_date_to = str(to_date) 
+    
+  part_1 = rf"""with base as (SELECT   
+  FACT.* ,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+  CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,
+  BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB'
+          WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+  FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+  LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+  LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+  LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+  WHERE 1=1 
+  AND RVSL_SEQ_NUM IS NULL 
+  AND REVERAL_IND = 'N'
+  AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+  AND FACT.ACCT_SROGT_ID= '{p_acct_no}' """
+
+
+  part_2 = rf""" 
+  AND (CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, '{p_trxn_no}', ',') 
+  RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )"""
+
+  part_3 = rf"""
+  
+  AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE({p_date_from}   , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+            AND COALESCE({p_date_to}    , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+  ),
+  acct_calc as (
+  select
+  base.* ,
+  right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+  right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+  length(to_num) as to_len
+  from  base
+  ),
+
+  final_calc as (
+  select 
+  acct_calc.* ,
+  COALESCE(
+  case when ACCT_SROGT_ID = fri_9 then
+          CASE 
+          WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+          WHEN TO_LEN >= 15 THEN TO_12
+          ELSE TO_9
+          END
+        WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+            THEN FRI_9
+        WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+        IBAN_VAL,
+        BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+  FROM acct_calc 
+  ),
+
+  MAIN_FACT_CTE AS (
+  SELECT  DISTINCT 
+  final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+  TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+  CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+  ROW_NUMBER() OVER (
+  PARTITION BY FCT_COUNTER_PRTY_ACCT
+  ORDER BY TSACTN_AMT DESC ) AS RN
+  FROM  final_calc 
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+  WHERE 1=1
+  qualify rn =1
+  ) ,
+
+  CT_PARTY_3_YEAR_AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+        ACCT_SROGT_ID
+        FROM (
+  select DISTINCT
+        CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+  from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+  inner join main_fact_cte mfc
+  on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1   
+  AND FT.RVSL_SEQ_NUM IS NULL 
+  AND FT.Reveral_IND = 'N'
+  and mfc.FCT_COUNTER_PRTY_ACCT is not null
+  and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce({p_date_to}  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID 
+                      ) ,
+  final_output as (
+
+  SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+  -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+              CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_Country,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.IBAN  END AS TFMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+  -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.IBAN   END AS TTMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+  from   main_fact_CTE MAIN_FACT
+  LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+  on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  --- main client SUB QUERY
+  left join
+  ( 
+    WITH AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+        FROM (
+  select DISTINCT 
+        CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+  from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+  WHERE  1 =1   
+  AND ACCT_SROGT_ID=   '{p_acct_no}'   -- '291808031' --: '329634296'  
+  AND RVSL_SEQ_NUM IS NULL 
+  AND Reveral_IND = 'N'
+  and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce({p_date_to}  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID  										
+                      )
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+  b.Branch_Code as teller,
+  e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ ,  C.IBAN_NUM AS IBAN , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state , 
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE,
+  i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+  from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+  where 1=1
+  and   c.ACCT_SROGT_ID =  '{p_acct_no}' 
+  ) MAIN_CLIENT 
+  ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+  ------ COUNTER PARTY 
+  left join
+  ( 
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+  e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ , C.IBAN_NUM AS IBAN, C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  b.Branch_Code as teller,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state ,  
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+  from   MAIN_FACT_CTE MAIN_FACT 
+  inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+  where 1=1
+  ) CT_PART
+  ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1  
+  and (ttmc_Account_ is not null and TFMC_account_ is not null )
+  /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+  and (TTMC_title is not null and TFMC_title is not null )
+  and (TTMC_state is not null and TFMC_state is not null )
+  and (TTMC_city is not null and TFMC_city is not null )*/
+  )
+  select main_Acc,
+  transactionnumber,
+  date_transaction,
+  authorized,
+  teller,
+  amount_local,
+  transmode_code,
+  to_funds_code,
+  from_funds_code,
+  CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+  CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+  CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+  CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+  CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+  CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+  CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+  CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+  CAST(TFMC_iban AS VARCHAR(100)) AS TFMC_iban,
+  CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+  CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+  CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+  CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+  CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+  CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+  CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+  CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+  CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+  CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+  CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+  CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+  CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+  CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+  CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+  CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+  CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+  CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+  CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+  CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+  CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+  CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+  CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+  CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+  CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+  CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+  CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+  CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+  CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+  CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TTMC_customer_Type_code,
+  CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TTMC_customer_Type_desc,
+  CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+  CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+  CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+  CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+  CAST(TTMC_iban AS VARCHAR(100)) AS TTMC_iban,
+  CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+  CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+  CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+  CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+  CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+  CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+  CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+  CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+  CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+  CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+  CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+  CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+  CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+  CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+  CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+  CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+  CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+  CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+  CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+  CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+  CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+  CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+  CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+  CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+  CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+  CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+  CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+  from final_output
+  
+  """
+  # print(p_trxn_no)
+  if p_trxn_no != '' or None:
+      # print("Trnx no found")
+      q = part_1 + part_2 + part_3
+  else:
+      q = part_1 + part_3
+
+  return q
+
+
+  q = rf""" 
+  with base as (SELECT   
+  FACT.* ,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+  CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,
+  BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB'
+          WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+  FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+  LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+  LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+  LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+  WHERE 1=1 
+  AND RVSL_SEQ_NUM IS NULL 
+  AND REVERAL_IND = 'N'
+  AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+  AND FACT.ACCT_SROGT_ID= '329634296' --'291808031' -- : '329634296'
+
+
+
+
+  /*AND (P_TXN_NO IS NULL OR P_TXN_NO = '' OR CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, :P_TXN_NO , ',') 
+  RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )*/
+
+
+  AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE(null , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+            AND COALESCE(null  , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+  ),
+  acct_calc as (
+  select
+  base.* ,
+  right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+  right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+  length(to_num) as to_len
+  from  base
+  ),
+
+  final_calc as (
+  select 
+  acct_calc.* ,
+  COALESCE(
+  case when ACCT_SROGT_ID = fri_9 then
+          CASE 
+          WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+          WHEN TO_LEN >= 15 THEN TO_12
+          ELSE TO_9
+          END
+        WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+            THEN FRI_9
+        WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+        IBAN_VAL,
+        BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+  FROM acct_calc 
+  ),
+
+  MAIN_FACT_CTE AS (
+  SELECT  DISTINCT 
+  final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+  TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+  CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+  ROW_NUMBER() OVER (
+  PARTITION BY FCT_COUNTER_PRTY_ACCT
+  ORDER BY TSACTN_AMT DESC ) AS RN
+  FROM  final_calc 
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+  WHERE 1=1
+  qualify rn =1
+  ) ,
+
+  CT_PARTY_3_YEAR_AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+        ACCT_SROGT_ID
+        FROM (
+  select DISTINCT
+        CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+  from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+  inner join main_fact_cte mfc
+  on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1   
+  AND FT.RVSL_SEQ_NUM IS NULL 
+  AND FT.Reveral_IND = 'N'
+  and mfc.FCT_COUNTER_PRTY_ACCT is not null
+  and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID 
+                      ) ,
+  final_output as (
+
+  SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+  -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+              CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_Country,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.IBAN  END AS TFMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+  -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.IBAN   END AS TTMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+  from   main_fact_CTE MAIN_FACT
+  LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+  on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  --- main client SUB QUERY
+  left join
+  ( 
+    WITH AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+        FROM (
+  select DISTINCT 
+        CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+  from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+  WHERE  1 =1   
+  AND ACCT_SROGT_ID=   '329634296'   -- '291808031' --: '329634296'  
+  AND RVSL_SEQ_NUM IS NULL 
+  AND Reveral_IND = 'N'
+  and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID  										
+                      )
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+  b.Branch_Code as teller,
+  e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ ,  C.IBAN_NUM AS IBAN , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state , 
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE,
+  i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+  from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+  where 1=1
+  and   c.ACCT_SROGT_ID =  '329634296' 
+  ) MAIN_CLIENT 
+  ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+  ------ COUNTER PARTY 
+  left join
+  ( 
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+  e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ , C.IBAN_NUM AS IBAN, C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  b.Branch_Code as teller,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state ,  
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+  from   MAIN_FACT_CTE MAIN_FACT 
+  inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+  where 1=1
+  ) CT_PART
+  ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1  
+  and (ttmc_Account_ is not null and TFMC_account_ is not null )
+  /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+  and (TTMC_title is not null and TFMC_title is not null )
+  and (TTMC_state is not null and TFMC_state is not null )
+  and (TTMC_city is not null and TFMC_city is not null )*/
+  )
+  select main_Acc,
+  transactionnumber,
+  date_transaction,
+  authorized,
+  teller,
+  amount_local,
+  transmode_code,
+  to_funds_code,
+  from_funds_code,
+  CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+  CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+  CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+  CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+  CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+  CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+  CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+  CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+  CAST(TFMC_iban AS VARCHAR(100)) AS TFMC_iban,
+  CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+  CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+  CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+  CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+  CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+  CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+  CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+  CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+  CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+  CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+  CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+  CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+  CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+  CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+  CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+  CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+  CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+  CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+  CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+  CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+  CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+  CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+  CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+  CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+  CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+  CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+  CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+  CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+  CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+  CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TTMC_customer_Type_code,
+  CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TTMC_customer_Type_desc,
+  CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+  CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+  CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+  CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+  CAST(TTMC_iban AS VARCHAR(100)) AS TTMC_iban,
+  CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+  CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+  CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+  CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+  CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+  CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+  CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+  CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+  CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+  CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+  CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+  CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+  CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+  CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+  CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+  CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+  CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+  CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+  CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+  CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+  CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+  CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+  CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+  CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+  CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+  CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+  CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+  from final_output
+  
+  """
+
+
+
+
+  
+def get_transactions_query2(account_number, transaction_id, from_date, to_date):
+  
+  p_acct_no = str(account_number)
+  p_trxn_no = str(transaction_id)
+  p_date_from = str(from_date) 
+  p_date_to = str(to_date) 
+    
+  part_1 = rf"""with base as (SELECT   
+  FACT.* ,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+  CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,
+  BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB'
+          WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+  FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+  LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+  LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+  LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+  WHERE 1=1 
+  AND RVSL_SEQ_NUM IS NULL 
+  AND REVERAL_IND = 'N'
+  AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+  AND FACT.ACCT_SROGT_ID= '{p_acct_no}' """
+
+
+  part_2 = rf""" 
+  AND (CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, '{p_trxn_no}', ',') 
+  RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )"""
+
+  part_3 = rf"""
+  
+  AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE({p_date_from}   , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+            AND COALESCE({p_date_to}    , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+  ),
+  acct_calc as (
+  select
+  base.* ,
+  right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+  right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+  length(to_num) as to_len
+  from  base
+  ),
+
+  final_calc as (
+  select 
+  acct_calc.* ,
+  COALESCE(
+  case when ACCT_SROGT_ID = fri_9 then
+          CASE 
+          WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+          WHEN TO_LEN >= 15 THEN TO_12
+          ELSE TO_9
+          END
+        WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+            THEN FRI_9
+        WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+        IBAN_VAL,
+        BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+  FROM acct_calc 
+  ),
+
+  MAIN_FACT_CTE AS (
+  SELECT  DISTINCT 
+  final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+  TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+  CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+  ROW_NUMBER() OVER (
+  PARTITION BY FCT_COUNTER_PRTY_ACCT
+  ORDER BY TSACTN_AMT DESC ) AS RN
+  FROM  final_calc 
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+  WHERE 1=1
+  qualify rn =1
+  ) ,
+
+  CT_PARTY_3_YEAR_AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+        ACCT_SROGT_ID
+        FROM (
+  select DISTINCT
+        CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+  from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+  inner join main_fact_cte mfc
+  on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1   
+  AND FT.RVSL_SEQ_NUM IS NULL 
+  AND FT.Reveral_IND = 'N'
+  and mfc.FCT_COUNTER_PRTY_ACCT is not null
+  and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce({p_date_to}  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID 
+                      ) ,
+  final_output as (
+
+  SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+  -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+              CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_Country,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.IBAN  END AS TFMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+  -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.IBAN   END AS TTMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+  from   main_fact_CTE MAIN_FACT
+  LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+  on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  --- main client SUB QUERY
+  left join
+  ( 
+    WITH AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+        FROM (
+  select DISTINCT 
+        CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+  from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+  WHERE  1 =1   
+  AND ACCT_SROGT_ID=   '{p_acct_no}'   -- '291808031' --: '329634296'  
+  AND RVSL_SEQ_NUM IS NULL 
+  AND Reveral_IND = 'N'
+  and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce({p_date_from}  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce({p_date_to}  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID  										
+                      )
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+  b.Branch_Code as teller,
+  e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ ,  C.IBAN_NUM AS IBAN , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state , 
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE,
+  i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+  from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+  where 1=1
+  and   c.ACCT_SROGT_ID =  '{p_acct_no}' 
+  ) MAIN_CLIENT 
+  ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+  ------ COUNTER PARTY 
+  left join
+  ( 
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+  e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ , C.IBAN_NUM AS IBAN, C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  b.Branch_Code as teller,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state ,  
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+  from   MAIN_FACT_CTE MAIN_FACT 
+  inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+  where 1=1
+  ) CT_PART
+  ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1  
+  and (ttmc_Account_ is not null and TFMC_account_ is not null )
+  /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+  and (TTMC_title is not null and TFMC_title is not null )
+  and (TTMC_state is not null and TFMC_state is not null )
+  and (TTMC_city is not null and TFMC_city is not null )*/
+  )
+  select main_Acc,
+  transactionnumber,
+  date_transaction,
+  authorized,
+  teller,
+  amount_local,
+  transmode_code,
+  to_funds_code,
+  from_funds_code,
+  CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+  CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+  CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+  CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+  CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+  CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+  CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+  CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+  CAST(TFMC_iban AS VARCHAR(100)) AS TFMC_iban,
+  CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+  CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+  CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+  CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+  CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+  CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+  CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+  CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+  CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+  CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+  CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+  CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+  CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+  CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+  CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+  CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+  CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+  CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+  CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+  CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+  CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+  CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+  CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+  CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+  CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+  CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+  CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+  CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+  CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+  CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TTMC_customer_Type_code,
+  CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TTMC_customer_Type_desc,
+  CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+  CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+  CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+  CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+  CAST(TTMC_iban AS VARCHAR(100)) AS TTMC_iban,
+  CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+  CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+  CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+  CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+  CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+  CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+  CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+  CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+  CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+  CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+  CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+  CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+  CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+  CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+  CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+  CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+  CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+  CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+  CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+  CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+  CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+  CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+  CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+  CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+  CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+  CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+  CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+  from final_output
+  
+  """
+  # print(p_trxn_no)
+  if p_trxn_no != '' or None:
+      # print("Trnx no found")
+      q = part_1 + part_2 + part_3
+  else:
+      q = part_1 + part_3
+
+  return q
+
+
+  q = rf""" 
+  with base as (SELECT   
+  FACT.* ,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'FR[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS FRI_NUM,
+  REGEXP_REPLACE(REGEXP_SUBSTR(FACT.TSACTN_DESC ,'TO[-]?([A-Z0-9]+)',1,1),'[^0-9]','') AS TO_NUM,
+  CASE WHEN FACT.CR_DR_IND = 'C' THEN cn.ORIG_IBAN ELSE cn.BENI_IBAN END AS IBAN_VAL,
+  BNFRY_ACCT_NO,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTEFT' ELSE '-' END AS FROM_FUNDS_CODE,
+    CASE WHEN FACT.TRML_ID = 'GNBAA' AND FACT.TSACTN_DESC LIKE '%DIGITAL%' 
+        THEN 'FTTRA' ELSE '-' END AS TO_FUNDS_CODE,
+    CASE WHEN TYP.TSACTN_TYPE_DESC LIKE '%DIGITAL%' 	THEN 'TMMOB'
+          WHEN TYP.TSACTN_TYPE_DESC LIKE '%INTERNET%' THEN 'TMITB' ELSE '-' END AS TRANSMODE_CODE
+  FROM   DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FACT
+  LEFT JOIN DP_SDMVW_DFDN.DIM_TSACTN_TYPE_VW TYP ON FACT.TSACTN_TYPE_EDW_ID = TYP.TSACTN_TYPE_EDW_ID
+  LEFT JOIN DP_SDMT_DFDN.DIM_CNTR_PRTY_TRXN CN ON CN.TRAN_ID = FACT.TSACTN_ID
+  LEFT JOIN DP_SDMT_DFDN.FCT_RTAIL_BNK_CNTR_PRTY_TSACTN  FCT_CNTR ON FACT.TSACTN_ID = FCT_CNTR.TSACTN_ID
+  WHERE 1=1 
+  AND RVSL_SEQ_NUM IS NULL 
+  AND REVERAL_IND = 'N'
+  AND (FACT.TSACTN_DESC LIKE '%FR%' AND FACT.TSACTN_DESC LIKE '%TO%' OR FACT.TSACTN_DESC LIKE '%DIGITAL%')
+  AND FACT.ACCT_SROGT_ID= '329634296' --'291808031' -- : '329634296'
+
+
+
+
+  /*AND (P_TXN_NO IS NULL OR P_TXN_NO = '' OR CAST(FACT.TSACTN_ID AS VARCHAR(1000)) IN (SELECT D.TOKEN FROM TABLE(STRTOK_SPLIT_TO_TABLE(1, :P_TXN_NO , ',') 
+  RETURNS (OUTKEY INTEGER,TOKENNUM INTEGER,TOKEN VARCHAR(20) CHARACTER SET UNICODE)) AS D) )*/
+
+
+  AND  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  BETWEEN COALESCE(null , CAST(ADD_MONTHS( CURRENT_DATE-1 , -36) AS VARCHAR(15)) ) 
+            AND COALESCE(null  , CAST(CURRENT_DATE-1 AS VARCHAR(15)) )
+  ),
+  acct_calc as (
+  select
+  base.* ,
+  right(FRI_NUM,9)  as  fri_9 , right(FRI_NUM, 12)  as  fri_12 ,
+  right(TO_NUM, 9 )  as   to_9, right(TO_NUM, 12)  as  to_12  ,
+  length(to_num) as to_len
+  from  base
+  ),
+
+  final_calc as (
+  select 
+  acct_calc.* ,
+  COALESCE(
+  case when ACCT_SROGT_ID = fri_9 then
+          CASE 
+          WHEN TSACTN_DESC LIKE '%TO-PK%'  THEN SUBSTR(REGEXP_SUBSTR(TSACTN_DESC,'(?<=TO\S)[A-Z0-9].*[0-9]',1,1,'i'),1,24)
+          WHEN TO_LEN >= 15 THEN TO_12
+          ELSE TO_9
+          END
+        WHEN ACCT_SROGT_ID = CASE WHEN TO_LEN >=15 THEN TO_12 ELSE TO_9 END
+            THEN FRI_9
+        WHEN ACCT_SROGT_ID = TO_9 THEN FRI_12 END ,
+        IBAN_VAL,
+        BNFRY_ACCT_NO ) AS FCT_COUNTER_PRTY_ACCT
+  FROM acct_calc 
+  ),
+
+  MAIN_FACT_CTE AS (
+  SELECT  DISTINCT 
+  final_calc.ACCT_SROGT_ID,TSACTN_ID,TSACTN_DT ,TSACTN_AMT,CR_DR_IND,
+  TSACTN_DESC,FROM_FUNDS_CODE,TO_FUNDS_CODE,TRANSMODE_CODE,
+  CASE 
+    WHEN FCT_COUNTER_PRTY_ACCT LIKE '%UNIL%' THEN  C.ACCT_SROGT_ID 
+    WHEN LENGTH(FCT_COUNTER_PRTY_ACCT) in ('11','12') AND D.ACCT_TITL IS NULL THEN RIGHT(FCT_COUNTER_PRTY_ACCT,9)
+    ELSE FCT_COUNTER_PRTY_ACCT  
+    END AS FCT_COUNTER_PRTY_ACCT,
+  ROW_NUMBER() OVER (
+  PARTITION BY FCT_COUNTER_PRTY_ACCT
+  ORDER BY TSACTN_AMT DESC ) AS RN
+  FROM  final_calc 
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = C.IBAN_NUM
+  LEFT JOIN  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW D
+  ON final_calc.FCT_COUNTER_PRTY_ACCT = D.ACCT_SROGT_ID
+  WHERE 1=1
+  qualify rn =1
+  ) ,
+
+  CT_PARTY_3_YEAR_AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS comments, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as beneficiary_comment, 
+        ACCT_SROGT_ID
+        FROM (
+  select DISTINCT
+        CASE WHEN ft.CR_DR_IND = 'C' and SRC_TYP <> 'NI' THEN (ft.TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN ft.CR_DR_IND = 'D' THEN (ft.TSACTN_AMT) END AS DR_AMOUNT, ft.ACCT_SROGT_ID, FT.TSACTN_ID
+  from  DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW FT
+  inner join main_fact_cte mfc
+  on ft.ACCT_SROGT_ID = MFC.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1   
+  AND FT.RVSL_SEQ_NUM IS NULL 
+  AND FT.Reveral_IND = 'N'
+  and mfc.FCT_COUNTER_PRTY_ACCT is not null
+  and  TO_CHAR(FT.TSACTN_DT,'YYYY-MM-DD') between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID 
+                      ) ,
+  final_output as (
+
+  SELECT  
+    MAIN_FACT.ACCT_SROGT_ID as main_Acc, 
+    CAST(main_fact.TSACTN_ID AS VARCHAR(255)) as transactionnumber,  
+    TO_CHAR(main_fact.TSACTN_DT , 'YYYY-MM-DD') ||  'T00:00:00' as date_transaction,
+    MAIN_CLIENT.BR_CITY_NAME AS authorized,
+    MAIN_CLIENT.teller as teller,
+    cast(main_fact.TSACTN_AMT AS DECIMAL(38,2)) as amount_local ,
+    main_fact.transmode_code as transmode_code,
+    main_fact.to_funds_code as to_funds_code ,
+    main_fact.from_funds_code as from_funds_code,
+  -- ============== MAIN CLIENT SENDER ====== T_FROM_MY_CLIENT====================
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_name  END AS TFMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_code  END AS TFMC_customer_type_code,
+              CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.customer_type_desc  END AS TFMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.institution_country  END AS TFMC_institution_Country,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.swift  END AS TFMC_swift,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.role_  END AS TFMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'C' THEN   regexp_replace(CT_PART.branch,'&',' and')   END AS TFMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_  END AS TFMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.IBAN  END AS TFMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.teller  END AS TFMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.title_  END AS TFMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART. currency_code END AS TFMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.account_name,'&','and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.account_name, '&' , ' and')  END AS TFMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.account_type  END AS TFMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.gender  END AS TFMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.first_name   END AS TFMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.last_name END AS TFMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.birthdate   END AS TFMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.mothers_name   END AS TFMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.ssn   END AS TFMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.nationality1   END AS TFMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_contact_type   END AS TFMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_communication_type   END AS TFMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_country_prefix   END AS TFMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.tph_number   END AS TFMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.address_type   END AS TFMC_addtyp,		
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')  END AS TFMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.city   END AS TFMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.country_code   END AS TFMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.state   END AS TFMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(MAIN_CLIENT.Occupation,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'C' THEN  regexp_replace(CT_PART.Occupation,  '&' ,'  and')   END AS TFMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.opened   END AS TFMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.STATUS_CODE   END AS TFMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.beneficiary_comment   END AS TFMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_P_3Y.comments   END AS TFMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'D' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'C' THEN  CT_PART.to_country   END AS TFMC_to_country,
+  -- ============== MAIN CLIENT RECEIVER ======T_TO_MY_CLIENT= ==========
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_name   END AS TTMC_institution_name,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_code   END AS TTMC_customer_type_code,
+        CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.customer_type_desc
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.customer_type_desc   END AS TTMC_customer_type_desc,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.institution_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.institution_country   END AS TTMC_institution_country,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.swift
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.swift   END AS TTMC_swift,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.role_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.role_   END AS TTMC_role,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.branch,'&',' and') 
+        WHEN main_fact.CR_DR_IND = 'D' THEN  regexp_replace(CT_PART.branch ,'&',' and')   END AS TTMC_branch,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_   END AS TTMC_account_,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.IBAN
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.IBAN   END AS TTMC_IBAN,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.teller
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.teller   END AS TTMC_teller,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.title_
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.title_   END AS TTMC_title,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.currency_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.currency_code   END AS TTMC_currency_code,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.account_name,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.account_name, '&',' and')   END AS TTMC_account_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.account_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.account_type   END AS TTMC_account_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.gender
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.gender   END AS TTMC_gender,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.first_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.first_name   END AS TTMC_first_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.last_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.last_name END AS TTMC_last_name,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.birthdate
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.birthdate   END AS TTMC_birthdate ,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.mothers_name
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.mothers_name   END AS TTMC_mothers_name ,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.ssn
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.ssn   END AS TTMC_ssn,
+  CASE WHEN main_fact.CR_DR_IND = 'C'  THEN MAIN_CLIENT.nationality1
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.nationality1   END AS TTMC_nationality1 ,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_contact_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_contact_type   END AS TTMC_tph_contact_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_communication_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_communication_type   END AS TTMC_tph_communication_type,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_country_prefix
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_country_prefix   END AS TTMC_tph_country_prefix,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.tph_number
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.tph_number   END AS TTMC_tph_number,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.address_type
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.address_type   END AS TTMC_addtyp,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(MAIN_CLIENT.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ) ,'&',' and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(trim( regexp_replace( oreplace(oreplace(CT_PART.address ,CHR(13),' '),CHR(10), ' '), '\s+', ' ' ) ),'&',' and')    END AS TTMC_address,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.city
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.city   END AS TTMC_city,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.country_code
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.country_code   END AS TTMC_country_code,			
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.state
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.state   END AS TTMC_state,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN regexp_replace(MAIN_CLIENT.Occupation,'&','and')
+        WHEN main_fact.CR_DR_IND = 'D' THEN regexp_replace(CT_PART.Occupation,'&','and')   END AS TTMC_Occupation,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.opened
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.opened   END AS TTMC_opened,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.STATUS_CODE
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.STATUS_CODE   END AS TTMC_STATUS_CODE,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.beneficiary_comment
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.beneficiary_comment   END AS TTMC_beneficiary_comment,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.comments
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_P_3Y.comments   END AS TTMC_comments,
+  CASE WHEN main_fact.CR_DR_IND = 'C' THEN MAIN_CLIENT.to_country
+        WHEN main_fact.CR_DR_IND = 'D' THEN CT_PART.to_country   END AS TTMC_to_country
+  from   main_fact_CTE MAIN_FACT
+  LEFT JOIN CT_PARTY_3_YEAR_AMOUNT AS CT_P_3Y  
+  on CT_P_3Y.ACCT_SROGT_ID = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  --- main client SUB QUERY
+  left join
+  ( 
+    WITH AMOUNT AS (
+        SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM (DR_AMOUNT) AS DECIMAL(38,2)) as Dr_amt, ACCT_SROGT_ID
+        FROM (
+  select DISTINCT 
+        CASE WHEN CR_DR_IND = 'C' and SRC_TYP <> 'NI'  THEN (TSACTN_AMT) END AS CR_AMOUNT,
+        CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID,TSACTN_ID
+  from DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW
+  WHERE  1 =1   
+  AND ACCT_SROGT_ID=   '329634296'   -- '291808031' --: '329634296'  
+  AND RVSL_SEQ_NUM IS NULL 
+  AND Reveral_IND = 'N'
+  and  TO_CHAR(TSACTN_DT,'YYYY-MM-DD')  between coalesce(NULL  , cast(add_months( CURRENT_DATE-1 , -36) as varchar(15)) ) 
+            and coalesce(NULL  , cast(CURRENT_DATE-1 as varchar(15)) )
+  )  A
+  group by ACCT_SROGT_ID  										
+                      )
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, COALESCE(B.CITY_NAME,B.BRNCH_DESC)  AS BR_CITY_NAME,
+  b.Branch_Code as teller,
+  e.CUST_TYPE_CD as customer_Type_code , e.CUST_TYPE_DESC as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ ,  C.IBAN_NUM AS IBAN , c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state , 
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE,
+  i.Dr_amt as beneficiary_comment, i.cr_amt as comments, d.CTRY_OF_NTLTY as to_country
+
+  from  DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  left join AMOUNT i on i.ACCT_SROGT_ID = c.ACCT_SROGT_ID
+  where 1=1
+  and   c.ACCT_SROGT_ID =  '329634296' 
+  ) MAIN_CLIENT 
+  ON MAIN_CLIENT.ACCOUNT_  = MAIN_FACT.ACCT_SROGT_ID
+  ------ COUNTER PARTY 
+  left join
+  ( 
+  select 
+  'UNITED BANK LIMITED ' as institution_name,  'UNILPKKA' as swift, 'PK' as institution_country,
+  b.BRNCH_DESC as branch, B.CITY_NAME AS BR_CITY_NAME,
+  e.cust_type_cd as customer_type_code, e.cust_type_desc as customer_Type_desc,
+  c.ACCT_SROGT_ID as account_ , C.IBAN_NUM AS IBAN, C.IBAN_NUM ,c.CURY_EDW_ID as currency_code,c.ACCT_TITL as account_name,
+  b.Branch_Code as teller,
+  case when c.DEP_TYPE = 'C' then 'ATCUR' WHEN  c.dep_Type = 'T' then 'ATTMD' when c.dep_Type = 'S' then 'ATSAV' end as account_type,
+  d.GNDR as gender, d.TITL as title_  ,
+  -- D.CUST_TYPE_EDW_ID IN ('38','3','32','34','33','37','31','35','36') 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) )  AS  first_name,
+  CASE WHEN TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )  = '' THEN 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM 1 
+  FOR POSITION (' ' IN   REGEXP_REPLACE(D.CUST_NAME , '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  - 1) ) 
+  ELSE 
+  TRIM(SUBSTRING(REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') FROM   
+  POSITION (' ' IN REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') || ' ')  + 1) )
+  END AS  Last_name,
+  case when CUST_TYPE_CD in ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+  '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') then 'ARCTA' 
+  when JOIN_ACCT_FLG = '1' then 'ARJTA'
+  when CUST_TYPE_CD = ('11') then 'ARMRB' else 'ARCTA' end as Role_,  
+  CAST(d.DT_OF_BIRTH AS VARCHAR(20)) ||  'T00:00:00' as birthdate,d.FTHR_NAME as mothers_name,d.IDNTFTN_VAL as ssn,d.CTRY_OF_NTLTY as nationality1,
+  case when d.MBL_NUM is not null then 'PAPVT' 
+        when d.MBL_NUM is null then 'PAOFF' end as tph_contact_type,
+  case when d.MBL_NUM is not null then 'COMOB' else 'COOTH' end as tph_communication_type,
+  case when d.MBL_NUM is not null and (substr(d.MBL_NUM,0,2) = '92' or substr(d.MBL_NUM,1,3) = '92') then '92'
+        when (length(substr(d.MBL_NUM,2,12)) = '10' or length(substr(d.MBL_NUM,3,13)) = '10' ) then '92'
+        when d.CTRY_OF_NTLTY = 'PK' THEN '92' 
+        else substr(d.MBL_NUM,0,2) end as tph_country_prefix,
+  case when d.MBL_NUM is not null then REGEXP_SUBSTR( d.MBL_NUM , '3.*')
+        else substr(d.PHN_BUSN,2,12) end as tph_number,
+  case when d.PERM_ADDR is not null then 'PAPVT' 
+        when d.PERM_ADDR is null then 'PAOFF' end as address_type,
+  case when D.MLG_ADDR is not null then D.MLG_ADDR else  D.PERM_ADDR end as address,
+  d.CTRY_OF_NTLTY AS country_code, 
+  case when D.RSDNTL_CITY = '0' or D.RSDNTL_CITY is null then  trim(regexp_substr(location , '[A-Z a-z]+')) else d.RSDNTL_CITY end as city,
+
+    coalesce(d.RGN_NAME, 
+        case
+            when FMC.STATE_LOC = 'NW' then 'KPK'
+            when FMC.STATE_LOC = 'AK' then 'AZAD KASHMIR'
+            when FMC.STATE_LOC = 'PJ' then 'PUNJAB'
+            when FMC.STATE_LOC = 'SD' then 'SINDH'
+            when FMC.STATE_LOC = 'BL' then 'BALOCHISTAN'
+            when FMC.STATE_LOC = 'IS' then 'ISLAMABAD'
+            when FMC.STATE_LOC IN ( 'GB' , 'FA' )  then 'GILGIT-BALISTAN'
+            END) AS state ,  
+        case when (c.SRC_OTHR is  null or  c.SRC_OTHR=  ' ' or  length(c.SRC_OTHR)  <=3  )  then  e.CUST_TYPE_DESC 
+        else c.SRC_OTHR  end as Occupation, 
+        TO_CHAR(cast(c.ACCT_OPN_DT as date) , 'YYYY-MM-DD') ||  'T00:00:00' as opened,
+  CASE WHEN c.ACCT_STS_EDW_ID = 'A' then 'ASACT'  when c.ACCT_STS_EDW_ID = 'C' then 'ASCBC' 
+          when c.ACCT_STS_EDW_ID = 'I' then 'ASINA'   when c.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+          when c.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+          ELSE 'ASOTH' END AS STATUS_CODE ,d.CTRY_OF_NTLTY as to_country
+  from   MAIN_FACT_CTE MAIN_FACT 
+  inner join DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW c   on  c.ACCT_SROGT_ID= MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  inner join DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b on c.BRNCH_SROGT_ID = b.Branch_Code
+  inner join  dp_wrk_cbs.fm_client_daily fmc on  c.CUST_SROGT_ID = fmc.client_no 
+  inner join  DP_SDMVW_DFDN.DIM_CUST_VW d on d.CUST_SROGT_ID = c.CUST_SROGT_ID and d.system_code = 'CBS'
+  inner join DP_SDMT_DFDN.DIM_CUST_TYPE_SS e on e.CUST_TYPE_EDW_ID = d.CUST_TYPE_EDW_ID
+  --where c.ACCT_SROGT_ID  in (select MAIN_FACT.FCT_COUNTER_PRTY_ACCT   from  MAIN_FACT_CTE MAIN_FACT )
+  where 1=1
+  ) CT_PART
+  ON CT_PART.account_ = MAIN_FACT.FCT_COUNTER_PRTY_ACCT 
+  WHERE  1 =1  
+  and (ttmc_Account_ is not null and TFMC_account_ is not null )
+  /*and (ttmc_birthdate is not null and tfmc_birthdate is not null )
+  and (TTMC_title is not null and TFMC_title is not null )
+  and (TTMC_state is not null and TFMC_state is not null )
+  and (TTMC_city is not null and TFMC_city is not null )*/
+  )
+  select main_Acc,
+  transactionnumber,
+  date_transaction,
+  authorized,
+  teller,
+  amount_local,
+  transmode_code,
+  to_funds_code,
+  from_funds_code,
+  CAST(TFMC_institution_name AS VARCHAR(100)) AS TFMC_institution_name,
+  CAST(TFMC_institution_country AS VARCHAR(100)) AS TFMC_institution_country,
+  CAST(TFMC_customer_type_code AS VARCHAR(100)) AS TFMC_customer_Type_code,
+  CAST(TFMC_customer_type_desc AS VARCHAR(100)) AS TFMC_customer_Type_desc,
+  CAST(TFMC_swift AS VARCHAR(100)) AS TFMC_swift,
+  CAST(TFMC_role AS VARCHAR(100)) AS TFMC_role,
+  CAST(TFMC_branch AS VARCHAR(100)) AS TFMC_branch,
+  CAST(TFMC_account_ AS VARCHAR(100)) AS TFMC_account_,
+  CAST(TFMC_iban AS VARCHAR(100)) AS TFMC_iban,
+  CAST(TFMC_teller AS VARCHAR(100)) AS TFMC_teller,
+  CAST(TFMC_title AS VARCHAR(100)) AS TFMC_title,
+  CAST(TFMC_currency_code AS VARCHAR(100)) AS TFMC_currency_code,
+  CAST(TFMC_account_name AS VARCHAR(100)) AS TFMC_account_name,
+  CAST(TFMC_account_type AS VARCHAR(100)) AS TFMC_account_type,
+  CAST(TFMC_gender AS VARCHAR(100)) AS TFMC_gender,
+  CAST(TFMC_first_name AS VARCHAR(100)) AS TFMC_first_name,
+  CAST(TFMC_last_name AS VARCHAR(100)) AS TFMC_last_name,
+  CAST(TFMC_birthdate AS VARCHAR(100)) AS TFMC_birthdate,
+  CAST(TFMC_mothers_name AS VARCHAR(100)) AS TFMC_mothers_name,
+  CAST(TFMC_ssn AS VARCHAR(100)) AS TFMC_ssn,
+  CAST(TFMC_nationality1 AS VARCHAR(100)) AS TFMC_nationality1,
+  CAST(TFMC_tph_contact_type AS VARCHAR(100)) AS TFMC_tph_contact_type,
+  CAST(TFMC_tph_communication_type AS VARCHAR(100)) AS TFMC_tph_communication_type,
+  CAST(TFMC_tph_country_prefix AS VARCHAR(100)) AS TFMC_tph_country_prefix,
+  CAST(TFMC_tph_number AS VARCHAR(100)) AS TFMC_tph_number,
+  CAST(TFMC_addtyp AS VARCHAR(100)) AS TFMC_addtyp,
+  CAST(TFMC_address AS VARCHAR(250)) AS TFMC_address,
+  CAST(TFMC_city AS VARCHAR(100)) AS TFMC_city,
+  CAST(TFMC_country_code AS VARCHAR(100)) AS TFMC_country_code,
+  CAST(TFMC_state AS VARCHAR(100)) AS TFMC_state,
+  CAST(TFMC_Occupation AS VARCHAR(100)) AS TFMC_Occupation,
+  CAST(TFMC_opened AS VARCHAR(100)) AS TFMC_opened,
+  CAST(TFMC_STATUS_CODE AS VARCHAR(100)) AS TFMC_STATUS_CODE,
+  CAST(TFMC_beneficiary_comment AS VARCHAR(100)) AS TFMC_beneficiary_comment,
+  CAST(TFMC_comments AS VARCHAR(100)) AS TFMC_comments,
+  CAST(TFMC_to_country AS VARCHAR(100)) AS TFMC_to_country,
+
+
+  CAST(TTMC_institution_name AS VARCHAR(100)) AS TTMC_institution_name,
+  CAST(TTMC_institution_country AS VARCHAR(100)) AS TTMC_institution_country,
+  CAST(TTMC_customer_type_code AS VARCHAR(100)) AS TTMC_customer_Type_code,
+  CAST(TTMC_customer_type_desc AS VARCHAR(100)) AS TTMC_customer_Type_desc,
+  CAST(TTMC_swift AS VARCHAR(100)) AS TTMC_swift,
+  CAST(TTMC_role AS VARCHAR(100)) AS TTMC_role,
+  CAST(TTMC_branch AS VARCHAR(100)) AS TTMC_branch,
+  CAST(TTMC_account_ AS VARCHAR(100)) AS TTMC_account_,
+  CAST(TTMC_iban AS VARCHAR(100)) AS TTMC_iban,
+  CAST(TTMC_teller AS VARCHAR(100)) AS TTMC_teller,
+  CAST(TTMC_title AS VARCHAR(100)) AS TTMC_title,
+  CAST(TTMC_currency_code AS VARCHAR(100)) AS TTMC_currency_code,
+  CAST(TTMC_account_name AS VARCHAR(100)) AS TTMC_account_name,
+  CAST(TTMC_account_type AS VARCHAR(100)) AS TTMC_account_type,
+  CAST(TTMC_gender AS VARCHAR(100)) AS TTMC_gender,
+  CAST(TTMC_first_name AS VARCHAR(100)) AS TTMC_first_name,
+  CAST(TTMC_last_name AS VARCHAR(100)) AS TTMC_last_name,
+  CAST(TTMC_birthdate AS VARCHAR(100)) AS TTMC_birthdate,
+  CAST(TTMC_mothers_name AS VARCHAR(100)) AS TTMC_mothers_name,
+  CAST(TTMC_ssn AS VARCHAR(100)) AS TTMC_ssn,
+  CAST(TTMC_nationality1 AS VARCHAR(100)) AS TTMC_nationality1,
+  CAST(TTMC_tph_contact_type AS VARCHAR(100)) AS TTMC_tph_contact_type,
+  CAST(TTMC_tph_communication_type AS VARCHAR(100)) AS TTMC_tph_communication_type,
+  CAST(TTMC_tph_country_prefix AS VARCHAR(100)) AS TTMC_tph_country_prefix,
+  CAST(TTMC_tph_number AS VARCHAR(100)) AS TTMC_tph_number,
+  CAST(TTMC_addtyp AS VARCHAR(100)) AS TTMC_addtyp,
+  CAST(TTMC_address AS VARCHAR(250)) AS TTMC_address,
+  CAST(TTMC_city AS VARCHAR(100)) AS TTMC_city,
+  CAST(TTMC_country_code AS VARCHAR(100)) AS TTMC_country_code,
+  CAST(TTMC_state AS VARCHAR(100)) AS TTMC_state,
+  CAST(TTMC_Occupation AS VARCHAR(100)) AS TTMC_Occupation,
+  CAST(TTMC_opened AS VARCHAR(100)) AS TTMC_opened,
+  CAST(TTMC_STATUS_CODE AS VARCHAR(100)) AS TTMC_STATUS_CODE,
+  CAST(TTMC_beneficiary_comment AS VARCHAR(100)) AS TTMC_beneficiary_comment,
+  CAST(TTMC_comments AS VARCHAR(100)) AS TTMC_comments,
+  CAST(TTMC_to_country AS VARCHAR(100)) AS TTMC_to_country
+
+  from final_output
+  
+  """
+
+def get_entity_detail_query(account_number):
+  """
+  Entity detail query - returns MAIN_CLIENT, DIRECTOR_CLIENT, MANDATE_CLIENT rows
+  with director info, mandate holders, and full account details for entity accounts.
+  Used to populate TFMC/TTMC entity account blocks in XML.
+  """
+  p_acct_no = str(account_number)
+
+  query = rf"""
+WITH ENTITY_MAIN_ACCT AS ( 
+    SELECT  
+        C.ACCT_SROGT_ID, 
+        C.ACCT_TITL, 
+        CAST(D.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(D.MBL_NUM, D.PHN_BUSN, D.PHN_RSDNC), '[^0-9]') AS MOBILE,
+        D.IDNTFTN_VAL, 
+        D.CUST_SROGT_ID, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(D.PERM_ADDR,''), ',?\/()-',''), '\s{{2,}}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(D.MLG_ADDR, ',?\/()-',''), '\s{{2,}}', '') AS VARCHAR(200)) AS MLG_ADDR
+    FROM DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+    INNER JOIN DP_SDMVW_DFDN.DIM_CUST_VW D 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+       AND D.SYSTEM_CODE = 'CBS' 
+    WHERE C.ACCT_SROGT_ID = '{p_acct_no}'
+), 
+
+DIM_CUST AS ( 
+    SELECT  
+        DC.CUST_SROGT_ID, 
+        DC.IDNTFTN_VAL, 
+        CAST(DC.E_ML_ADDR AS VARCHAR(100)) AS E_ML_ADDR,
+        OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]') AS NEW_MOBILE,
+        CASE 
+            WHEN NEW_MOBILE LIKE '0092%' THEN SUBSTR(NEW_MOBILE,5) 
+            WHEN NEW_MOBILE LIKE '+92%'  THEN SUBSTR(NEW_MOBILE,4) 
+            WHEN NEW_MOBILE LIKE '3%'    THEN '0'||NEW_MOBILE 
+            WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=13 THEN SUBSTR(NEW_MOBILE,3) 
+            WHEN NEW_MOBILE LIKE '92%' AND LENGTH(NEW_MOBILE)=12 THEN '0'||SUBSTR(NEW_MOBILE,3) 
+            ELSE NEW_MOBILE 
+        END AS MOBILE, 
+        CAST(REGEXP_REPLACE(OTRANSLATE(NULLIF(DC.PERM_ADDR,''), ',?\/()-',''), '\s{{2,}}', '') AS VARCHAR(200)) AS PERM_ADDR,
+        CAST(REGEXP_REPLACE(OTRANSLATE(DC.MLG_ADDR, ',?\/()-',''), '\s{{2,}}', '') AS VARCHAR(200)) AS MLG_ADDR, 
+        DC.SYSTEM_CODE, 
+        DC.CUST_TYPE_EDW_ID, 
+        C.CUST_TYPE_DESC,  
+        C.CUST_TYPE_CD,
+        ROW_NUMBER() OVER(PARTITION BY DC.CUST_SROGT_ID, DC.SYSTEM_CODE ORDER BY DC.START_DATE DESC) AS RN 
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW DC 
+    LEFT JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS C 
+        ON C.CUST_TYPE_EDW_ID = DC.CUST_TYPE_EDW_ID AND C.SYSTEM_CODE = 'CBS' 
+    INNER JOIN ENTITY_MAIN_ACCT EM 
+        ON (
+            COALESCE(DC.PERM_ADDR, 'abc') = COALESCE(EM.PERM_ADDR, 'abc')
+            OR COALESCE(
+                 OREPLACE(COALESCE(DC.MBL_NUM, DC.PHN_BUSN, DC.PHN_RSDNC), '[^0-9]'),
+                 '123'
+               ) = COALESCE(NULLIF(EM.MOBILE,''), 'x12x')
+            OR COALESCE(DC.IDNTFTN_VAL, 'abc') = COALESCE(EM.IDNTFTN_VAL, 'abc')
+            OR COALESCE(DC.MLG_ADDR, 'abc') = COALESCE(EM.MLG_ADDR, 'abc')
+            OR COALESCE(DC.E_ML_ADDR, 'abc') = COALESCE(EM.E_ML_ADDR, 'abc')
+        )
+    WHERE DC.SYSTEM_CODE = 'CBS'
+),
+
+RB_RELATED_ACCTS AS ( 
+    SELECT DISTINCT 
+        C.ACCT_SROGT_ID AS ACCT_NO 
+    FROM ENTITY_MAIN_ACCT EM
+    INNER JOIN DIM_CUST D ON D.SYSTEM_CODE = 'CBS'
+    LEFT JOIN DP_SDMVW_DFDN.DIM_RTAIL_BNK_ACCT_VW C 
+        ON D.CUST_SROGT_ID = C.CUST_SROGT_ID 
+    WHERE 1=1
+    AND D.CUST_TYPE_CD IN ('03','31','32','33','34','35','36','37','38')
+    AND C.ACCT_SROGT_ID = '{p_acct_no}'
+),
+
+AMOUNT AS (
+    SELECT CAST(SUM(CR_AMOUNT) AS DECIMAL(38,2)) AS cr_amt, CAST(SUM(DR_AMOUNT) AS DECIMAL(38,2)) AS Dr_amt, ACCT_SROGT_ID
+    FROM (
+        SELECT DISTINCT 
+            CASE WHEN CR_DR_IND = 'C' AND SRC_TYP <> 'NI' THEN (TSACTN_AMT) END AS CR_AMOUNT,
+            CASE WHEN CR_DR_IND = 'D' THEN (TSACTN_AMT) END AS DR_AMOUNT, ACCT_SROGT_ID, TSACTN_ID
+        FROM DP_SDMVW_DFDN.FCT_RTAIL_BNK_TSACTN_VW txn 
+        INNER JOIN RB_RELATED_ACCTS RRA ON TXN.ACCT_SROGT_ID = RRA.ACCT_NO
+        WHERE 1=1   
+        AND RVSL_SEQ_NUM IS NULL 
+        AND Reveral_IND = 'N'
+        AND TO_CHAR(TSACTN_DT,'YYYY-MM-DD') BETWEEN COALESCE(NULL, CAST(ADD_MONTHS(CURRENT_DATE-1, -36) AS VARCHAR(15))) 
+            AND COALESCE(NULL, CAST(CURRENT_DATE-1 AS VARCHAR(15)))
+    ) A
+    GROUP BY ACCT_SROGT_ID
+),
+
+CLEAN_NAME AS (
+    SELECT 
+        REGEXP_REPLACE(D.CUST_NAME, '^(MR|MRS|MISS|MS|DR)[.]?[ ]*','',1,1,'i') AS NAME_CLEAN,
+        D.*
+    FROM DP_SDMVW_DFDN.DIM_CUST_VW D
+),
+
+DIM_CUST_VW AS (
+    SELECT  
+        D.CUST_SROGT_ID,
+        D.FTHR_NAME AS mothers_name, 
+        D.IDNTFTN_VAL AS ssn, 
+        D.CTRY_OF_NTLTY AS nationality1,
+        D.GNDR AS gender,
+        TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1)) AS first_name,
+        CASE 
+            WHEN TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1)) = '' 
+            THEN TRIM(SUBSTRING(NAME_CLEAN FROM 1 FOR POSITION(' ' IN NAME_CLEAN || ' ') - 1))
+            ELSE TRIM(SUBSTRING(NAME_CLEAN FROM POSITION(' ' IN NAME_CLEAN || ' ') + 1))
+        END AS last_name,
+        D.CUST_TYPE_EDW_ID,
+        D.CTRY_OF_NTLTY AS to_country,  
+        D.CUST_SROGT_ID AS CUST_NUM, 
+        CAST(D.DT_OF_BIRTH AS VARCHAR(20)) || 'T00:00:00' AS birthdate,
+        CASE WHEN D.MBL_NUM IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS tph_contact_type,
+        CASE WHEN D.MBL_NUM IS NOT NULL THEN 'COMOB' ELSE 'COOTH' END AS tph_communication_type,
+        CASE 
+            WHEN D.MBL_NUM IS NOT NULL AND (SUBSTR(D.MBL_NUM,0,2) = '92' OR SUBSTR(D.MBL_NUM,1,3) = '92') THEN '92'
+            WHEN LENGTH(SUBSTR(D.MBL_NUM,2,12)) = 10 OR LENGTH(SUBSTR(D.MBL_NUM,3,13)) = 10 THEN '92'
+            WHEN D.CTRY_OF_NTLTY = 'PK' THEN '92'
+            ELSE SUBSTR(D.MBL_NUM,0,2) 
+        END AS tph_country_prefix,
+        COALESCE(REGEXP_SUBSTR(D.MBL_NUM,'3.*'), SUBSTR(D.PHN_BUSN,2,12)) AS tph_number,
+        CASE WHEN D.PERM_ADDR IS NOT NULL THEN 'PAPVT' ELSE 'PAOFF' END AS address_type,
+        COALESCE(D.MLG_ADDR, D.PERM_ADDR) AS address,
+        D.CTRY_OF_NTLTY AS country_code, 
+        CASE 
+            WHEN D.RSDNTL_CITY = '0' OR D.RSDNTL_CITY IS NULL 
+            THEN TRIM(REGEXP_SUBSTR(location,'[A-Z a-z]+')) 
+            ELSE D.RSDNTL_CITY 
+        END AS city,
+        COALESCE(D.RGN_NAME,
+            CASE FMC.STATE_LOC
+                WHEN 'NW' THEN 'KPK'
+                WHEN 'AK' THEN 'AZAD KASHMIR'
+                WHEN 'PJ' THEN 'PUNJAB'
+                WHEN 'SD' THEN 'SINDH'
+                WHEN 'BL' THEN 'BALOCHISTAN'
+                WHEN 'IS' THEN 'ISLAMABAD'
+                WHEN 'GB' THEN 'GILGIT-BALISTAN'
+                WHEN 'FA' THEN 'GILGIT-BALISTAN'
+            END
+        ) AS state,
+        'UNITED BANK LIMITED' AS institution_name,  
+        'UNILPKKA' AS swift, 
+        'PK' AS institution_country,
+        'ETPVT' AS incorporation_legal_form,
+        e.CUST_TYPE_CD AS CUST_TYPE_CD,
+        e.CUST_TYPE_DESC AS CUST_TYPE_DESC
+    FROM CLEAN_NAME D
+    INNER JOIN dp_wrk_cbs.fm_client_daily FMC ON D.CUST_SROGT_ID = FMC.client_no AND D.system_code = 'CBS'
+    INNER JOIN DP_SDMT_DFDN.DIM_CUST_TYPE_SS E ON E.CUST_TYPE_EDW_ID = D.CUST_TYPE_EDW_ID
+)
+
+-- Mandate Client
+SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'MANDATE_CLIENT' AS TYP, MA.CLIENT_NO, 'ARPYS' AS ROLE_OUTER, dc.CUST_SROGT_ID,
+       dc.mothers_name, dc.ssn, dc.nationality1, dc.gender, dc.first_name, dc.last_name, dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC, dc.to_country, dc.CUST_NUM, dc.birthdate, dc.tph_contact_type,
+       dc.tph_communication_type, dc.tph_country_prefix, dc.tph_number, dc.address_type,
+       dc.address, dc.country_code, dc.city, dc.state,
+       dc.institution_name, dc.swift, dc.institution_country, dc.incorporation_legal_form,
+       b.BRNCH_DESC AS branch, 
+       COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+       b.Branch_Code AS teller,
+       DIM_ACCT.ACCT_SROGT_ID AS account_, 
+       DIM_ACCT.IBAN_NUM, 
+       DIM_ACCT.CURY_EDW_ID AS currency_code,
+       DIM_ACCT.ACCT_TITL AS account_name,
+       DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+       DIM_ACCT.SRC_OF_FUND AS business, 
+       CASE 
+           WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                 '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+           WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+           WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+           ELSE 'ARCTA' 
+       END AS Role_, 
+       CASE 
+           WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+           WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+           WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+       END AS account_type,
+       TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+       CASE 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+           ELSE 'ASOTH' 
+       END AS STATUS_CODE,
+       i.Dr_amt AS beneficiary_comment, i.cr_amt AS comments
+FROM DIM_CUST_VW DC
+LEFT JOIN DP_REPORTING_MART.TM_DM_MD_MANDATE_AUTHORIZE MA ON DC.CUST_SROGT_ID = MA.CLIENT_NO AND CAST(MA.START_DATE AS DATE) = CURRENT_DATE - 1 
+INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.ACCT_SROGT_ID = MA.ACCT_NO
+LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+LEFT JOIN AMOUNT i ON i.ACCT_SROGT_ID = RRA.ACCT_NO
+
+UNION ALL
+
+-- Director Client
+SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'DIRECTOR_CLIENT' AS TYP, DRC.CLIENT_NO, 'ARPYS' AS ROLE_OUTER, dc.CUST_SROGT_ID,
+       dc.mothers_name, dc.ssn, dc.nationality1, dc.gender, dc.first_name, dc.last_name, dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC, dc.to_country, dc.CUST_NUM, dc.birthdate, dc.tph_contact_type,
+       dc.tph_communication_type, dc.tph_country_prefix, dc.tph_number, dc.address_type,
+       dc.address, dc.country_code, dc.city, dc.state,
+       dc.institution_name, dc.swift, dc.institution_country, dc.incorporation_legal_form,
+       b.BRNCH_DESC AS branch, 
+       COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+       b.Branch_Code AS teller,
+       DIM_ACCT.ACCT_SROGT_ID AS account_, 
+       DIM_ACCT.IBAN_NUM, 
+       DIM_ACCT.CURY_EDW_ID AS currency_code,
+       DIM_ACCT.ACCT_TITL AS account_name,
+       DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+       DIM_ACCT.SRC_OF_FUND AS business, 
+       CASE 
+           WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                 '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+           WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+           WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+           ELSE 'ARCTA' 
+       END AS Role_, 
+       CASE 
+           WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+           WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+           WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+       END AS account_type,
+       TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+       CASE 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+           ELSE 'ASOTH' 
+       END AS STATUS_CODE,
+       i.Dr_amt AS beneficiary_comment, i.cr_amt AS comments
+FROM DIM_CUST_VW DC
+INNER JOIN DP_REPORTING_MART.FM_DIRECTOR_DTLS DRC ON DC.CUST_SROGT_ID = DRC.CLIENT_NO_DIR AND CAST(DRC.START_DATE AS DATE) = CURRENT_DATE - 1 
+INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DRC.CLIENT_NO
+LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+LEFT JOIN AMOUNT i ON i.ACCT_SROGT_ID = RRA.ACCT_NO
+
+UNION ALL
+
+-- Main Client
+SELECT DISTINCT DIM_ACCT.ACCT_SROGT_ID AS ACCT_NUM, DIM_ACCT.ACCT_DESC,
+       'MAIN_CLIENT' AS TYP, CAST(DC.CUST_NUM AS VARCHAR(100)) AS CLIENT_NO,
+       CAST('' AS VARCHAR(100)) AS ROLE_OUTER, dc.CUST_SROGT_ID,
+       dc.mothers_name, dc.ssn, dc.nationality1, dc.gender, dc.first_name, dc.last_name, dc.CUST_TYPE_CD,
+       dc.CUST_TYPE_DESC, dc.to_country, dc.CUST_NUM, dc.birthdate, dc.tph_contact_type,
+       dc.tph_communication_type, dc.tph_country_prefix, dc.tph_number, dc.address_type,
+       dc.address, dc.country_code, dc.city, dc.state,
+       dc.institution_name, dc.swift, dc.institution_country, dc.incorporation_legal_form,
+       b.BRNCH_DESC AS branch, 
+       COALESCE(B.CITY_NAME,B.BRNCH_DESC) AS BR_CITY_NAME, 
+       b.Branch_Code AS teller,
+       DIM_ACCT.ACCT_SROGT_ID AS account_, 
+       DIM_ACCT.IBAN_NUM, 
+       DIM_ACCT.CURY_EDW_ID AS currency_code,
+       DIM_ACCT.ACCT_TITL AS account_name,
+       DIM_ACCT.ACCT_TITL AS ENTITY_NAME, 
+       DIM_ACCT.SRC_OF_FUND AS business, 
+       CASE 
+           WHEN CUST_TYPE_CD IN ('14','06','13','16','15','07','04','30','19','28','25','02','09','38','03',
+                                 '05','10','01','26','21','18','12','24','20','29','22','23','08','27','31') THEN 'ARCTA'
+           WHEN JOIN_ACCT_FLG = '1' THEN 'ARJTA'
+           WHEN CUST_TYPE_CD = '11' THEN 'ARMRB' 
+           ELSE 'ARCTA' 
+       END AS Role_, 
+       CASE 
+           WHEN DIM_ACCT.DEP_TYPE = 'C' THEN 'ATCUR' 
+           WHEN DIM_ACCT.dep_Type = 'T' THEN 'ATTMD' 
+           WHEN DIM_ACCT.dep_Type = 'S' THEN 'ATSAV' 
+       END AS account_type,
+       TO_CHAR(CAST(DIM_ACCT.ACCT_OPN_DT AS DATE), 'YYYY-MM-DD') || 'T00:00:00' AS opened,
+       CASE 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'A' THEN 'ASACT'  
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'C' THEN 'ASCBC' 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'I' THEN 'ASINA'   
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'N' THEN 'ASNAC' 
+           WHEN DIM_ACCT.ACCT_STS_EDW_ID = 'D' THEN 'ASDOR'
+           ELSE 'ASOTH' 
+       END AS STATUS_CODE,
+       i.Dr_amt AS beneficiary_comment, i.cr_amt AS comments
+FROM DIM_CUST_VW DC
+INNER JOIN DP_SDMT_DFDN.DIM_RTAIL_BNK_ACCT_SS DIM_ACCT ON DIM_ACCT.CUST_SROGT_ID = DC.CUST_SROGT_ID
+LEFT JOIN DP_SDMVW_DFDN.DIM_BRNCH_HIERARCHY_VW b ON DIM_ACCT.BRNCH_SROGT_ID = b.Branch_Code
+INNER JOIN RB_RELATED_ACCTS RRA ON DIM_ACCT.ACCT_SROGT_ID = RRA.ACCT_NO
+LEFT JOIN AMOUNT i ON i.ACCT_SROGT_ID = RRA.ACCT_NO
+"""
+
+  return query

@@ -1,0 +1,1 @@
+NUMERIC_CODE_PATTERN = r"^\d+$"

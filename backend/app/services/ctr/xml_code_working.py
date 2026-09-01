@@ -1,0 +1,657 @@
+"""
+CTR XML Generator
+=================
+Converts Excel query output into goAML-compliant XML for CTR reporting.
+
+Supports four cases:
+  1. entity_deposit        - Entity in TO account, person in FROM
+  2. entity_withdrawal     - Entity in FROM account, person in TO
+  3. individual_deposit    - Individual account in TO, person in FROM
+  4. individual_withdrawal - Individual account in FROM, person in TO
+
+Usage:
+  python ctr_xml_generator.py <case> <excel_file> <output_xml>
+"""
+
+from datetime import datetime
+import datetime
+import sys
+import pandas as pd
+from .fetch_data import fetch_data
+from xml.sax.saxutils import escape
+from fastapi.responses import Response
+
+
+# ─────────────────────────────────────────────
+# CONFIGURATION / CONSTANTS
+# ─────────────────────────────────────────────
+MAX_DIRECTORS = 10
+MAX_SIGNATORIES = 8
+
+REPORT_HEADER = {
+    "rentity_id": "43",
+    "rentity_branch": "43",
+    "submission_code": "E",
+    "report_code": "CTR",
+    "entity_reference": "UBL-CTR-11MAY2026-11MAY2026-1-1",
+    "submission_date": "2026-05-13T00:00:00",
+    "currency_code_local": "PKR",
+}
+
+REPORTING_PERSON = {
+    "gender": "M",
+    "title": "Divisional Head",
+    "first_name": "Farrukh",
+    "last_name": "Khalil",
+    "birthdate": "1984-06-30T00:00:00",
+    "ssn": "4220127380591",
+    "nationality1": "PK",
+    "tph_contact_type": "PAOFF",
+    "tph_communication_type": "COLAN",
+    "tph_country_prefix": "92",
+    "tph_number": "990332957",
+    "tph_extension": "17110",
+    "address_type": "PAOFF",
+    "address": "UBL Head Office",
+    "town": "Karachi",
+    "city": "Karachi",
+    "country_code": "PK",
+    "state": "Sindh",
+    "email": "farrukh.khalil@ubl.com.pk",
+    "occupation": "Money Laundering AND Reporting Officer",
+}
+
+LOCATION = {
+    "address_type": "PAOFF",
+    "address": "UBL Head Office",
+    "city": "karachi",
+    "country_code": "PK",
+    "state": "Sindh",
+}
+
+
+# ─────────────────────────────────────────────
+# UTILITY FUNCTIONS
+# ─────────────────────────────────────────────
+def safe(val):
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if s in ("?", "nan", "NaN", "None", ""):
+        return ""
+    return escape(s)
+
+
+def is_available(val):
+    if val is None:
+        return False
+    s = str(val).strip()
+    return s not in ("?", "nan", "NaN", "None", "")
+
+
+def format_date(val):
+    s = str(val).strip()
+    if "T" in s:
+        return s
+    try:
+        dt = pd.to_datetime(s)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return s
+
+
+def format_exchange_rate(val):
+    try:
+        return str(round(float(val), 1))
+    except (ValueError, TypeError):
+        return safe(val)
+
+
+def tag(name, value):
+    return f"<{name}>{safe(value)}</{name}>\n"
+
+
+def country_prefix_to_code(val):
+    s = str(val).strip()
+    if s.upper() == "PK":
+        return "92"
+    if s in ("?", "nan", "NaN", "None", ""):
+        return "92"
+    return s
+
+
+# ─────────────────────────────────────────────
+# XML BLOCK BUILDERS (shared)
+# ─────────────────────────────────────────────
+def build_report_header(transaction_date):
+    dt = pd.to_datetime(transaction_date)           
+    formatted_date = dt.strftime("%d%b%Y").upper()
+    today_date = pd.to_datetime("today").strftime("%Y-%m-%dT%H:%M:%S")
+    print("Today's date:", today_date)
+    # h = REPORT_HEADER
+    REPORT_HEADER = {
+    "rentity_id": "43",
+    "rentity_branch": "43",
+    "submission_code": "E",
+    "report_code": "CTR",
+    "entity_reference": f"UBL-CTR-{formatted_date}-{formatted_date}-1-1",
+    "submission_date": today_date,
+    "currency_code_local": "PKR",
+    }
+
+    xml = "<report>\n"
+    for k in ("rentity_id", "rentity_branch", "submission_code", "report_code",
+              "entity_reference", "submission_date", "currency_code_local"):
+        xml += tag(k, REPORT_HEADER[k])
+    return xml
+
+
+def build_reporting_person():
+    rp = REPORTING_PERSON
+    xml = "<reporting_person>\n"
+    xml += tag("gender", rp["gender"])
+    xml += tag("title", rp["title"])
+    xml += tag("first_name", rp["first_name"])
+    xml += tag("last_name", rp["last_name"])
+    xml += tag("birthdate", rp["birthdate"])
+    xml += tag("ssn", rp["ssn"])
+    xml += tag("nationality1", rp["nationality1"])
+    xml += "<phones>\n<phone>\n"
+    xml += tag("tph_contact_type", rp["tph_contact_type"])
+    xml += tag("tph_communication_type", rp["tph_communication_type"])
+    xml += tag("tph_country_prefix", rp["tph_country_prefix"])
+    xml += tag("tph_number", rp["tph_number"])
+    xml += tag("tph_extension", rp["tph_extension"])
+    xml += "</phone>\n</phones>\n"
+    xml += "<addresses>\n<address>\n"
+    xml += tag("address_type", rp["address_type"])
+    xml += tag("address", rp["address"])
+    xml += tag("town", rp["town"])
+    xml += tag("city", rp["city"])
+    xml += tag("country_code", rp["country_code"])
+    xml += tag("state", rp["state"])
+    xml += "</address>\n</addresses>\n"
+    xml += tag("email", rp["email"])
+    xml += tag("occupation", rp["occupation"])
+    xml += "</reporting_person>\n"
+    return xml
+
+
+def build_location():
+    loc = LOCATION
+    xml = "<location>\n"
+    xml += tag("address_type", loc["address_type"])
+    xml += tag("address", loc["address"])
+    xml += tag("city", loc["city"])
+    xml += tag("country_code", loc["country_code"])
+    xml += tag("state", loc["state"])
+    xml += "</location>\n<reason></reason>\n"
+    return xml
+
+
+def build_phone_block(contact_type, comm_type, prefix, number):
+    xml = "<phones>\n<phone>\n"
+    xml += tag("tph_contact_type", contact_type)
+    xml += tag("tph_communication_type", comm_type)
+    xml += tag("tph_country_prefix", country_prefix_to_code(prefix))
+    xml += tag("tph_number", number)
+    xml += "</phone>\n</phones>\n"
+    return xml
+
+
+def build_address_block(addr_type, address, city, country_code, state):
+    xml = "<addresses>\n<address>\n"
+    xml += tag("address_type", addr_type)
+    xml += tag("address", address)
+    xml += tag("city", city)
+    xml += tag("country_code", country_code)
+    xml += tag("state", state)
+    xml += "</address>\n</addresses>\n"
+    return xml
+
+
+def build_foreign_currency_block(direction, currency_code, amount, rate):
+    xml = f"<{direction}_foreign_currency>\n"
+    xml += tag("foreign_currency_code", currency_code)
+    xml += tag("foreign_amount", amount)
+    xml += tag("foreign_exchange_rate", format_exchange_rate(rate))
+    xml += f"</{direction}_foreign_currency>\n"
+    return xml
+
+
+def build_transaction_header(row):
+    xml = "<transaction>\n"
+    xml += tag("transactionnumber", row.get("transactionnumber", ""))
+    xml += tag("transaction_location", row.get("transaction_location", ""))
+    xml += tag("transaction_description", row.get("transaction_description", ""))
+    xml += tag("date_transaction", format_date(row.get("date_transaction", "")))
+    xml += tag("teller", row.get("teller", ""))
+    xml += tag("authorized", row.get("authorized", ""))
+    xml += tag("transmode_code", row.get("transmode_code", ""))
+    xml += tag("amount_local", row.get("amount_local", ""))
+    return xml
+
+
+# ─────────────────────────────────────────────
+# PERSON BLOCK (used for the non-account party)
+# ─────────────────────────────────────────────
+def build_person_block(tag_name, row, prefix, include_residence=True,
+                       include_comments=False):
+    """
+    Build from_person / to_person.
+    prefix: 'TFMC_' or 'TTMC_' — the person-side column prefix.
+    include_residence: True for entity cases, False for individual cases.
+    include_comments: True for individual cases (<comments></comments>).
+    """
+    xml = f"<{tag_name}>\n"
+    xml += tag("gender", row.get(f"{prefix}Gender", ""))
+    xml += tag("title", row.get(f"{prefix}Title", ""))
+    xml += tag("first_name", row.get(f"{prefix}First_Name", ""))
+    xml += tag("last_name", row.get(f"{prefix}Last_Name", ""))
+    xml += tag("birthdate", format_date(row.get(f"{prefix}Birth_Date", "")))
+    xml += tag("mothers_name", row.get(f"{prefix}Mother_Name", ""))
+    if row.get(f"{prefix}ssn_type", "") == "PPT":
+        xml += tag("passport_number", row.get(f"{prefix}ssn", ""))
+        xml += tag("passport_country", row.get(f"{prefix}nationality1", ""))
+    else:
+        xml += tag("ssn", row.get(f"{prefix}ssn", ""))
+    xml += tag("nationality1", row.get(f"{prefix}nationality1", ""))
+    if include_residence:
+        xml += tag("residence", row.get(f"{prefix}Residence", ""))
+    xml += build_phone_block(
+        row.get(f"{prefix}tph_contact_type", ""),
+        row.get(f"{prefix}tph_communication_type", ""),
+        row.get(f"{prefix}tph_country_prefix", ""),
+        row.get(f"{prefix}tph_number", ""),
+    )
+    xml += build_address_block(
+        row.get(f"{prefix}address_type", ""),
+        row.get(f"{prefix}address", ""),
+        row.get(f"{prefix}city", ""),
+        row.get(f"{prefix}country_code", ""),
+        row.get(f"{prefix}state", ""),
+    )
+    xml += tag("occupation", row.get(f"{prefix}occupation", ""))
+    if include_comments:
+        xml += "<comments></comments>\n"
+    xml += f"</{tag_name}>\n"
+    return xml
+
+
+# ─────────────────────────────────────────────
+# DIRECTOR BLOCK (entity cases only)
+# ─────────────────────────────────────────────
+def build_director_block(row, dir_num, entity_city, entity_country, entity_state):
+    prefix = f"DIR{dir_num}_"
+    if not is_available(row.get(f"{prefix}FIRSTNAME", "")):
+        return ""
+    xml = f"<director_{dir_num}>\n"
+    xml += tag("gender", row.get(f"{prefix}GENDER", ""))
+    xml += tag("title", row.get(f"{prefix}TITLE", ""))
+    xml += tag("first_name", row.get(f"{prefix}FIRSTNAME", ""))
+    xml += tag("last_name", row.get(f"{prefix}LASTNAME", ""))
+    xml += tag("birthdate", format_date(row.get(f"{prefix}DATE_OF_BIRTH", "")))
+    xml += tag("mothers_name", row.get(f"{prefix}FATHER_NAME", ""))
+    if row.get(f"{prefix}ssn_type", "") == "PPT":
+        xml += tag("passport_number", row.get(f"{prefix}ssn", ""))
+        xml += tag("passport_country", row.get(f"{prefix}nationality1", ""))
+    else:
+        xml += tag("ssn", row.get(f"{prefix}ssn", ""))
+    xml += tag("nationality1", row.get(f"{prefix}nationality1", ""))
+    xml += tag("residence", row.get(f"{prefix}Residence", ""))
+    xml += build_phone_block("PAPVT", "COMOB", "92", row.get(f"{prefix}TPH_NUMBER", ""))
+    xml += build_address_block("PARPE", row.get(f"{prefix}ADDRESS", ""),
+                               entity_city, entity_country, entity_state)
+    xml += tag("occupation", row.get(f"{prefix}OCCUPATION", ""))
+    xml += tag("role", "ERDIR")
+    xml += f"</director_{dir_num}>\n"
+    return xml
+
+
+# ─────────────────────────────────────────────
+# SIGNATORY BLOCK
+# Two variants: entity vs individual
+# ─────────────────────────────────────────────
+def build_signatory_entity(row, sig_num, entity_city, entity_country, entity_state,
+                           is_primary=False):
+    """Signatory for entity cases: hardcoded PAPVT/COMOB/PARPE, nationality=PK."""
+    prefix = f"SIGNATORY{sig_num}_"
+    if not is_available(row.get(f"{prefix}FIRSTNAME", "")):
+        return ""
+    xml = f"<signatory_{sig_num}>\n"
+    if is_primary:
+        xml += tag("is_primary", "true")
+    xml += "<t_person>\n"
+    xml += tag("gender", row.get(f"{prefix}GENDER", ""))
+    xml += tag("title", row.get(f"{prefix}TITLE", ""))
+    xml += tag("first_name", row.get(f"{prefix}FIRSTNAME", ""))
+    xml += tag("last_name", row.get(f"{prefix}LASTNAME", ""))
+    xml += tag("birthdate", format_date(row.get(f"{prefix}DATE_OF_BIRTH", "")))
+    xml += tag("mothers_name", row.get(f"{prefix}FATHER_NAME", ""))
+    if row.get(f"{prefix}ssn_type", "") == "PPT":
+        xml += tag("passport_number", row.get(f"{prefix}ssn", ""))
+        xml += tag("passport_country", row.get(f"{prefix}nationality1", ""))
+    else:
+        xml += tag("ssn", row.get(f"{prefix}ssn", ""))
+    xml += tag("nationality1", row.get(f"{prefix}nationality1", ""))
+    xml += tag("residence", row.get(f"{prefix}Residence", ""))
+    xml += build_phone_block("PAPVT", "COMOB", "92", row.get(f"{prefix}TPH_NUMBER", ""))
+    xml += build_address_block("PARPE", row.get(f"{prefix}ADDRESS", ""),
+                               entity_city, entity_country, entity_state)
+    xml += tag("occupation", row.get(f"{prefix}OCCUPATION", ""))
+    xml += "</t_person>\n"
+    xml += tag("role", "ARPYS")
+    xml += f"</signatory_{sig_num}>\n"
+    return xml
+
+
+def build_signatory_individual(row, sig_num, acct_city, acct_country, acct_state,
+                               is_primary=False):
+    """Signatory for individual cases: PAREG/COMOB/PAREG, no residence."""
+    prefix = f"SIGNATORY{sig_num}_"
+    if not is_available(row.get(f"{prefix}FIRSTNAME", "")):
+        return ""
+    xml = "<signatory>\n"
+    if is_primary:
+        xml += tag("is_primary", "true")
+    xml += "<t_person>\n"
+    xml += tag("gender", row.get(f"{prefix}GENDER", ""))
+    xml += tag("title", row.get(f"{prefix}TITLE", ""))
+    xml += tag("first_name", row.get(f"{prefix}FIRSTNAME", ""))
+    xml += tag("last_name", row.get(f"{prefix}LASTNAME", ""))
+    xml += tag("birthdate", format_date(row.get(f"{prefix}DATE_OF_BIRTH", "")))
+    xml += tag("mothers_name", row.get(f"{prefix}FATHER_NAME", ""))
+    if row.get(f"{prefix}ssn_type", "") == "PPT":
+        xml += tag("passport_number", row.get(f"{prefix}ssn", ""))
+        xml += tag("passport_country", row.get(f"{prefix}nationality1", ""))
+    else:
+        xml += tag("ssn", row.get(f"{prefix}ssn", ""))
+    xml += tag("nationality1", row.get(f"{prefix}nationality1", ""))
+    xml += build_phone_block("PAREG", "COMOB", "92", row.get(f"{prefix}TPH_NUMBER", ""))
+    xml += build_address_block("PAREG", row.get(f"{prefix}ADDRESS", ""),
+                               acct_city, acct_country, acct_state)
+    xml += tag("occupation", row.get(f"{prefix}OCCUPATION", ""))
+    xml += "</t_person>\n"
+    xml += tag("role", "ARPYS")
+    xml += "</signatory>\n"
+    return xml
+
+
+# ─────────────────────────────────────────────
+# ACCOUNT BLOCKS
+# ─────────────────────────────────────────────
+def build_entity_account_block(row, prefix, direction):
+    """
+    Full account block for ENTITY cases: account + t_entity + directors + signatories.
+    prefix: 'TFMC_' or 'TTMC_'
+    direction: 'from' or 'to'
+    """
+    entity_city = safe(row.get(f"{prefix}city", ""))
+    entity_country = safe(row.get(f"{prefix}country_code", ""))
+    entity_state = safe(row.get(f"{prefix}state", ""))
+
+    xml = f"<{direction}_account>\n"
+    xml += tag("institution_name", row.get(f"{prefix}institution_name", ""))
+    xml += tag("institution_code", row.get(f"{prefix}institution_code", ""))
+    xml += tag("non_bank_institution", row.get(f"{prefix}non_bank_institution", ""))
+    xml += tag("branch", row.get(f"{prefix}branch", ""))
+    xml += tag("account", row.get(f"{prefix}account", ""))
+    xml += tag("currency_code", row.get(f"{prefix}currency_code", ""))
+    xml += tag("account_name", row.get(f"{prefix}account_name", ""))
+    xml += tag("personal_account_type", row.get(f"{prefix}personal_account_type", ""))
+
+    # t_entity
+    xml += "<t_entity>\n"
+    xml += tag("name", row.get(f"{prefix}name", ""))
+    xml += tag("incorporation_legal_form", row.get(f"{prefix}incorporation_legal_form", ""))
+    xml += tag("business", row.get(f"{prefix}business", ""))
+    xml += build_phone_block(
+        row.get(f"{prefix}tph_contact_type", ""),
+        row.get(f"{prefix}tph_communication_type", ""),
+        row.get(f"{prefix}tph_country_prefix", ""),
+        row.get(f"{prefix}tph_number", ""),
+    )
+    xml += build_address_block(
+        row.get(f"{prefix}address_type", ""),
+        row.get(f"{prefix}address", ""),
+        entity_city, entity_country, entity_state,
+    )
+    xml += tag("incorporation_country_code", row.get(f"{prefix}incorporation_country_code", ""))
+
+    for i in range(1, MAX_DIRECTORS + 1):
+        xml += build_director_block(row, i, entity_city, entity_country, entity_state)
+
+    tax_num = ""
+    if is_available(row.get("TMC_TAX_NUM", "")):
+        tax_num = row["TMC_TAX_NUM"]
+    elif is_available(row.get(f"{prefix}TAX_NUM", "")):
+        tax_num = row[f"{prefix}TAX_NUM"]
+    xml += tag("tax_number", tax_num)
+    xml += "</t_entity>\n"
+
+    for i in range(1, MAX_SIGNATORIES + 1):
+        xml += build_signatory_entity(row, i, entity_city, entity_country, entity_state,
+                                      is_primary=(i == 1))
+
+    xml += tag("opened", format_date(row.get(f"{prefix}open", "")))
+    xml += tag("status_code", row.get(f"{prefix}status_code", ""))
+    xml += f"</{direction}_account>\n"
+    return xml
+
+
+def build_individual_account_block(row, prefix, direction):
+    """
+    Account block for INDIVIDUAL cases: account + signatories (no t_entity, no directors).
+    prefix: 'TFMC_' or 'TTMC_'
+    direction: 'from' or 'to'
+    """
+    acct_city = safe(row.get(f"{prefix}city", ""))
+    acct_country = safe(row.get(f"{prefix}country_code", ""))
+    acct_state = safe(row.get(f"{prefix}state", ""))
+
+    xml = f"<{direction}_account>\n"
+    xml += tag("institution_name", row.get(f"{prefix}institution_name", ""))
+    xml += tag("institution_code", row.get(f"{prefix}institution_code", ""))
+    xml += tag("non_bank_institution", row.get(f"{prefix}non_bank_institution", ""))
+    xml += tag("branch", row.get(f"{prefix}branch", ""))
+    xml += tag("account", row.get(f"{prefix}account", ""))
+    xml += tag("currency_code", row.get(f"{prefix}currency_code", ""))
+    xml += tag("account_name", row.get(f"{prefix}account_name", ""))
+    xml += tag("personal_account_type", row.get(f"{prefix}personal_account_type", ""))
+
+    for i in range(1, MAX_SIGNATORIES + 1):
+        xml += build_signatory_individual(row, i, acct_city, acct_country, acct_state,
+                                          is_primary=(i == 1))
+
+    xml += tag("opened", format_date(row.get(f"{prefix}open", "")))
+    xml += tag("status_code", row.get(f"{prefix}status_code", ""))
+    xml += f"</{direction}_account>\n"
+    return xml
+
+
+# ─────────────────────────────────────────────
+# TRANSACTION BUILDERS
+# ─────────────────────────────────────────────
+def build_transaction_entity_deposit(row):
+    """Entity Deposit: t_from (person) + t_to_my_client (entity account)."""
+    xml = build_transaction_header(row)
+
+    xml += "<t_from>\n"
+    xml += tag("from_funds_code", row.get("TFMC_from_funds_code", ""))
+    currency = safe(row.get("TTMC_currency_code", "PKR"))
+    fc = row.get("TTMC_Foreign_Currency_Code", "")
+    if currency != "PKR" and is_available(fc):
+        xml += build_foreign_currency_block("from", fc,
+                   row.get("TTMC_Foreign_Amount", ""),
+                   row.get("TTMC_Foreign_Exchange_Rate", ""))
+    xml += build_person_block("from_person", row, "TFMC_")
+    xml += tag("from_country", row.get("TFMC_from_country", ""))
+    xml += "</t_from>\n"
+
+    xml += "<t_to_my_client>\n"
+    xml += tag("to_funds_code", row.get("TTMC_to_funds_code", ""))
+    xml += build_entity_account_block(row, "TTMC_", "to")
+    xml += tag("to_country", row.get("TTMC_to_country", ""))
+    xml += "</t_to_my_client>\n"
+
+    xml += "</transaction>\n"
+    return xml
+
+
+def build_transaction_entity_withdrawal(row):
+    """Entity Withdrawal: t_from_my_client (entity account) + t_to (person)."""
+    xml = build_transaction_header(row)
+
+    xml += "<t_from_my_client>\n"
+    xml += tag("from_funds_code", row.get("TFMC_from_funds_code", ""))
+    xml += build_entity_account_block(row, "TFMC_", "from")
+    xml += tag("from_country", row.get("TFMC_from_country", ""))
+    xml += "</t_from_my_client>\n"
+
+    xml += "<t_to>\n"
+    xml += tag("to_funds_code", row.get("TTMC_to_funds_code", ""))
+    currency = safe(row.get("TFMC_currency_code", "PKR"))
+    if currency != "PKR":
+        fc = row.get("TFMC_Foreign_Currency_Code", "")
+        if is_available(fc):
+            xml += build_foreign_currency_block("to", fc,
+                       row.get("TFMC_Foreign_Amount", ""),
+                       row.get("TFMC_Foreign_Exchange_Rate", ""))
+    xml += build_person_block("to_person", row, "TTMC_")
+    xml += tag("to_country", row.get("TTMC_to_country", ""))
+    xml += "</t_to>\n"
+
+    xml += "</transaction>\n"
+    return xml
+
+
+def build_transaction_individual_deposit(row):
+    """Individual Deposit: t_from_my_client (person) + t_to_my_client (individual account)."""
+    xml = build_transaction_header(row)
+
+    xml += "<t_from_my_client>\n"
+    xml += tag("from_funds_code", row.get("TFMC_from_funds_code", ""))
+    currency = safe(row.get("TTMC_currency_code", "PKR"))
+    fc = row.get("TTMC_Foreign_Currency_Code", "")
+    if currency != "PKR" and is_available(fc):
+        xml += build_foreign_currency_block("from", fc,
+                   row.get("TTMC_Foreign_Amount", ""),
+                   row.get("TTMC_Foreign_Exchange_Rate", ""))
+    xml += build_person_block("from_person", row, "TFMC_",
+                              include_residence=False, include_comments=True)
+    xml += tag("from_country", row.get("TFMC_from_country", ""))
+    xml += "</t_from_my_client>\n"
+
+    xml += "<t_to_my_client>\n"
+    xml += tag("to_funds_code", row.get("TTMC_to_funds_code", ""))
+    xml += build_individual_account_block(row, "TTMC_", "to")
+    xml += tag("to_country", row.get("TTMC_to_country", ""))
+    xml += "</t_to_my_client>\n"
+
+    xml += "<comments></comments>\n"
+    xml += "</transaction>\n"
+    return xml
+
+
+def build_transaction_individual_withdrawal(row):
+    """Individual Withdrawal: t_from_my_client (individual account) + t_to_my_client (person)."""
+    xml = build_transaction_header(row)
+
+    xml += "<t_from_my_client>\n"
+    xml += tag("from_funds_code", row.get("TFMC_from_funds_code", ""))
+    xml += build_individual_account_block(row, "TFMC_", "from")
+    xml += tag("from_country", row.get("TFMC_from_country", ""))
+    xml += "</t_from_my_client>\n"
+
+    xml += "<t_to_my_client>\n"
+    xml += tag("to_funds_code", row.get("TTMC_to_funds_code", ""))
+    currency = safe(row.get("TFMC_currency_code", "PKR"))
+    if currency != "PKR":
+        fc = row.get("TFMC_Foreign_Currency_Code", "")
+        if is_available(fc):
+            xml += build_foreign_currency_block("to", fc,
+                       row.get("TFMC_Foreign_Amount", ""),
+                       row.get("TFMC_Foreign_Exchange_Rate", ""))
+    xml += build_person_block("to_person", row, "TTMC_",
+                              include_residence=False, include_comments=True)
+    xml += tag("to_country", row.get("TTMC_to_country", ""))
+    xml += "</t_to_my_client>\n"
+
+    xml += "<comments></comments>\n"
+    xml += "</transaction>\n"
+    return xml
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+BUILDERS = {
+    "entity_deposit": build_transaction_entity_deposit,
+    "entity_withdrawal": build_transaction_entity_withdrawal,
+    "individual_deposit": build_transaction_individual_deposit,
+    "individual_withdrawal": build_transaction_individual_withdrawal,
+}
+
+def create_file_name(transaction_date, cr_dr_flag, entity_individual_flag, split_num):
+    if cr_dr_flag == 'CR' :
+        part_1 = 'DEP'
+    elif cr_dr_flag == 'DR' :
+        part_1 = 'WHT'
+    if entity_individual_flag == 'ENTITY' :
+        part_2 = 'ENT'
+    elif entity_individual_flag == 'INDIVIDUAL' :
+        part_2 = 'IND'
+
+    file_name = f"{part_1} {part_2} {split_num} {transaction_date}.xml"
+    return file_name
+
+
+def generate_ctr_xml(transaction_date, cr_dr_flag, entity_individual_flag):
+    case = None
+    if cr_dr_flag == 'DR' and entity_individual_flag == 'INDIVIDUAL':
+        case = 'individual_withdrawal'
+    elif cr_dr_flag == 'CR' and entity_individual_flag == 'INDIVIDUAL':
+        case = 'individual_deposit'
+    elif cr_dr_flag == 'DR' and entity_individual_flag == 'ENTITY':
+        case = 'entity_withdrawal'
+    elif cr_dr_flag == 'CR' and entity_individual_flag == 'ENTITY':
+        case = 'entity_deposit'
+    elif entity_individual_flag == 'individual' and cr_dr_flag == 'debit':
+        case = 'individual_withdrawal'
+
+    df = fetch_data(transaction_date, cr_dr_flag, entity_individual_flag)
+    
+    # df = pd.read_excel(excel_file, dtype=str)
+    df = df.fillna("")
+
+    xml = build_report_header(transaction_date)
+    xml += build_reporting_person()
+    xml += build_location()
+
+    build_transaction = BUILDERS[case]
+    for _, row in df.iterrows():
+        xml += build_transaction(row)
+
+    xml += "</report>"
+    output_file_name = create_file_name(transaction_date, cr_dr_flag, entity_individual_flag, 1)
+    print(f"Generated {output_file_name}: {len(df)} transactions")
+
+
+    return Response(
+        content=xml,
+        media_type="application/xml",
+        headers={
+            "Content-Disposition": 'attachment; filename="{}"'.format(output_file_name)
+        }
+    )
+
+
+
+if __name__ == "__main__":
+    case = 'entity_deposit'  # Change this to the desired case: 'entity_deposit', 'entity_withdrawal', 'individual_deposit', 'individual_withdrawal'
+    excel_file = r'C:\Regalytics\CTR\Queries\Sample Data Files\ENTITY_DEPOSIT(CREDIT)_CASH_TRXNS(11-MAY-2026).xlsx'
+
+    output_file = r'C:\Regalytics\CTR\Queries\Generated XML\entity_deposit.xml'
+
+
+    generate_ctr_xml(case, excel_file, output_file)

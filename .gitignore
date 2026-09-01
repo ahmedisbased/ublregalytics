@@ -1,0 +1,23 @@
+# Secrets & environment (Backend)
+backend/venv
+backend/venv_backup
+backend/app/.env
+*.pem
+backend/keys
+
+# Secrets & environment (Frontend)
+frontend/node_modules
+
+# Python
+__pycache__/
+*.pyc
+
+# Local data dumps written by the XML pipeline (may contain real customer data)
+debug.log
+individual_data.csv
+wallet_query_data.csv
+cbs_cc_query_data.csv
+entity_query_data.csv
+entity_detail_data.csv
+
+frontend/.env
