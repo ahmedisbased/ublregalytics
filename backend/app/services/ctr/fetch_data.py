@@ -28,12 +28,15 @@ def fetch_data(transaction_date, cr_dr_flag, entity_individual_flag):
         check = check_query()
         
         print(f"the query we got is this : {check}")
-        check_result = pd.read_sql(check, conn)
-        value_exists = check_result['STATUS'].isin(['READY'
-        ]).any()
-        print(f" valueeee {value_exists}")
-        print(f"check result is this {check_result}")
+        # check_result = pd.read_sql(check, conn)
+        # value_exists = check_result['STATUS'].isin(['READY'
+        # ]).any()
+        # print(f" valueeee {value_exists}")
+        # print(f"check result is this {check_result}")
+        value_exists = True
         if not value_exists:
+            # later when i uncomment i need to return check_result instead of None
+
             return None
         
         query = get_cash_deposit_query_v2(transaction_date, entity_individual_flag )
@@ -42,15 +45,18 @@ def fetch_data(transaction_date, cr_dr_flag, entity_individual_flag):
 
     elif cr_dr_flag == 'DR':
         print("in DR")
-        check = check_query()
-        print(f"the query we got is this : {check}")
-        check_result = pd.read_sql(check, conn)
-        value_exists = check_result['STATUS'].isin(['READY'
-        ]).any()
-        print(f" valueeee {value_exists}")
-        print(f"check result is this {check_result}")
+        # check = check_query()
+        # print(f"the query we got is this : {check}")
+        # check_result = pd.read_sql(check, conn)
+        # value_exists = check_result['STATUS'].isin(['READY'
+        # ]).any()
+        # print(f" valueeee {value_exists}")
+        # print(f"check result is this {check_result}")
+        value_exists = True
+
         if not value_exists:
-            return check_result
+            # later when i uncomment i need to return check_result instead of None
+            return None
        
         query = get_cash_withdrawal_query_v2(transaction_date, entity_individual_flag )
         query_result = pd.read_sql(query, conn)

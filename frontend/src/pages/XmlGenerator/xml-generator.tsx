@@ -1,7 +1,88 @@
 import { useState } from 'react';
 import { FaFileCode, FaDownload, FaInfoCircle } from 'react-icons/fa';
-import { generateXml } from '../../services/xmlService';
+import {
+    generateXmlStream,
+    type StrErrorDetail,
+    type StrStreamEvent,
+} from '../../services/xmlService';
 import './xml-generator.scss';
+
+type ErrorLike = {
+    response?: {
+        status?: number;
+        data?: unknown;
+    };
+    message?: string;
+};
+
+type ProgressStatus = {
+    stage: string;
+    message: string;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null;
+
+const readStrError = (error: unknown) => {
+    const response = (error as ErrorLike).response;
+    const data = response?.data;
+    const detail = isRecord(data) ? data.detail : undefined;
+
+    if (isRecord(detail)) {
+        return {
+            status: response?.status,
+            detail: detail as StrErrorDetail,
+        };
+    }
+
+    if (typeof detail === 'string') {
+        return {
+            status: response?.status,
+            detail: { message: detail } as StrErrorDetail,
+        };
+    }
+
+    return { status: response?.status, detail: null as StrErrorDetail | null };
+};
+
+const categoryLabel = (category: string | undefined) => {
+    if (!category) return 'STR ERROR';
+    if (category === 'TERADATA') return 'TERADATA ERROR';
+    if (category === 'NO_DATA') return 'NO DATA';
+    return `${category.replaceAll('_', ' ')} ERROR`;
+};
+
+const formatStrError = (
+    detail: StrErrorDetail | null,
+    status: number | undefined,
+    fallback: string,
+) => {
+    if (detail?.message) {
+        if (detail.category === 'TERADATA' || detail.category === 'NO_DATA') {
+            return detail.message;
+        }
+        const category = categoryLabel(detail.category);
+        const stage = detail.stage ? ` Stage: ${detail.stage}.` : '';
+        return `${category}: ${detail.message}${stage}`;
+    }
+    if (status === 504) return 'TIMEOUT ERROR: The STR request exceeded the server time limit.';
+    return fallback;
+};
+
+const progressSteps = [
+    { key: 'connecting', label: 'Connect to Teradata' },
+    { key: 'running_query', label: 'Run query' },
+    { key: 'building_xml', label: 'Build XML' },
+    { key: 'complete', label: 'Ready' },
+];
+
+const progressRank = (stage: string) => {
+    if (stage === 'starting' || stage === 'connecting') return 0;
+    if (stage === 'connected' || stage === 'running_query') return 1;
+    if (stage === 'building_xml') return 2;
+    if (stage === 'complete') return 3;
+    return -1;
+};
 
 const XmlGenerator = () => {
     const [accountNumber, setAccountNumber] = useState('');
@@ -12,25 +93,32 @@ const XmlGenerator = () => {
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
     const [xmlBlob, setXmlBlob] = useState<Blob | null>(null);
     const [generatedAccount, setGeneratedAccount] = useState<string | null>(null);
+    const [requestId, setRequestId] = useState<string | null>(null);
+    const [progressStatus, setProgressStatus] = useState<ProgressStatus | null>(null);
+
+    const reportValidationError = (message: string) => {
+        setErrorMessage(message);
+        setProgressStatus({ stage: 'error', message });
+    };
 
     const validate = () => {
         if (!accountNumber.trim()) {
-            setErrorMessage('Account Number is required.');
+            reportValidationError('Account Number is required.');
             return false;
         }
         if (transactionId.trim()){
             if (!/^\d+(?:\s*,\s*\d+)*$/.test(transactionId.trim())) {
-                setErrorMessage('Transaction ID must be numbers separated by commas (e.g., 6576766566,6576765588) ');
+                reportValidationError('Transaction ID must be numbers separated by commas (e.g., 6576766566,6576765588) ');
                 return false;
             }
         }
         
         if (fromDate && !/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
-            setErrorMessage('From Date must be in YYYY-MM-DD format.');
+            reportValidationError('From Date must be in YYYY-MM-DD format.');
             return false;
         }
         if (toDate && !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
-            setErrorMessage('To Date must be in YYYY-MM-DD format.');
+            reportValidationError('To Date must be in YYYY-MM-DD format.');
             return false;
         }
         return true;
@@ -40,38 +128,62 @@ const XmlGenerator = () => {
         setErrorMessage(null);
         setXmlBlob(null);
         setGeneratedAccount(null);
+        setRequestId(null);
+        setProgressStatus({
+            stage: 'starting',
+            message: 'Starting STR XML generation...',
+        });
 
         if (!validate()) return;
 
         setIsLoading(true);
         try {
-            const response = await generateXml({
-                main_account: accountNumber.trim(),
-                transaction_number: transactionId.trim() || '',
-                from_date: fromDate || null,
-                to_date: toDate || null,
-            });
-            const xmlString = response.data.xml;
-            const blob = new Blob([xmlString], { type: 'application/xml' });
-            setXmlBlob(blob);
-            setGeneratedAccount(accountNumber.trim());
-        } catch (err) {
-            const error = err as {
-                response?: { status?: number; data?: {detail?: unknown}};
+            const handleStreamEvent = (event: StrStreamEvent) => {
+                setRequestId(event.request_id);
+                if (event.type === 'status') {
+                    setProgressStatus({ stage: event.stage, message: event.message });
+                    return;
+                }
+
+                if (event.type === 'complete') {
+                    const blob = new Blob([event.xml], { type: 'application/xml' });
+                    setXmlBlob(blob);
+                    setGeneratedAccount(accountNumber.trim());
+                    setProgressStatus({
+                        stage: 'complete',
+                        message: 'XML generation completed successfully.',
+                    });
+                    return;
+                }
+
+                const message = formatStrError(event.error, undefined, 'STR generation failed.');
+                setErrorMessage(message);
+                setProgressStatus({ stage: 'error', message });
             };
-            const status = error.response?.status;
-            const detail = error.response?.data?.detail
-            if (status === 404 || detail === 'NO RECORDS'){
-                setErrorMessage('No records found against the given account details')
-            } else if (status === 504 || !error.response){
-                setErrorMessage('Query execution timed out. Please try again later.')
-            } else {
-                setErrorMessage(
-                    typeof detail === 'string'
-                    ? detail
-                    : 'Something went wrong generating the XML. Please try again'
+
+            await generateXmlStream(
+                {
+                    main_account: accountNumber.trim(),
+                    transaction_number: transactionId.trim() || '',
+                    from_date: fromDate || null,
+                    to_date: toDate || null,
+                },
+                handleStreamEvent,
+            );
+        } catch (err) {
+            const parsedError = readStrError(err);
+            const errorLike = err as ErrorLike;
+            const message = !errorLike.response
+                ? `NETWORK ERROR: Could not reach the STR backend. ${errorLike.message ?? 'Check the API connection and try again.'}`
+                : formatStrError(
+                    parsedError.detail,
+                    parsedError.status,
+                    `STR ERROR: The backend returned HTTP ${parsedError.status ?? 'an unknown error'}.`,
                 );
-            }
+
+            setRequestId(parsedError.detail?.request_id ?? null);
+            setErrorMessage(message);
+            setProgressStatus({ stage: 'error', message });
         } finally {
             setIsLoading(false);
         }
@@ -134,8 +246,45 @@ const XmlGenerator = () => {
 
                             {errorMessage && (
                                 <div className="alert alert-danger" role="alert">
-                                    {errorMessage}
+                                    <strong className="d-block mb-1">STR generation failed</strong>
+                                    <span>{errorMessage}</span>
                                 </div>
+                            )}
+
+                            {progressStatus && (
+                                <section
+                                    className={`str-progress-panel ${progressStatus.stage === 'error' ? 'error' : ''}`}
+                                    aria-live="polite"
+                                >
+                                    <div className="str-progress-heading">
+                                        <div className="d-flex align-items-start gap-2">
+                                            <span className="str-progress-dot" />
+                                            <div>
+                                                <p className="str-progress-kicker">STR generation status</p>
+                                                <strong>{progressStatus.message}</strong>
+                                            </div>
+                                        </div>
+                                        {requestId && <small>Request ID: {requestId}</small>}
+                                    </div>
+                                    <ol className="str-progress-steps">
+                                        {progressSteps.map((step, index) => {
+                                            const rank = progressRank(progressStatus.stage);
+                                            const stepState = progressStatus.stage === 'error'
+                                                ? 'pending'
+                                                : rank > index
+                                                    ? 'complete'
+                                                    : rank === index
+                                                        ? 'active'
+                                                        : 'pending';
+                                            return (
+                                                <li className={stepState} key={step.key}>
+                                                    <span>{index + 1}</span>
+                                                    <small>{step.label}</small>
+                                                </li>
+                                            );
+                                        })}
+                                    </ol>
+                                </section>
                             )}
 
                             {/* Form Fields */}

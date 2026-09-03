@@ -6,14 +6,7 @@ from .auth import (
     LogoutRequest,
 )
 from .str_python import StrSchemaRequest
-from .ctr import (
-    CTRData,
-    CtrSchemaRequest,
-    CsvBatchSchemaRequest,
-    CsvSchemaRequest,
-    XlsxBatchSchemaRequest,
-    XlsxSchemaRequest,
-)
+from .ctr import CTRData,CtrSchemaRequest,CsvSchemaRequest
 from .rcoa import UpdateGlSlMappingRequest, StartReportingRequest, EndReportingRequest,ViewGlSlMappingRequest
 from .rcoa import ViewTermDepositsMappingRequest, UpdateTermDepositMappingRequest
 from .rcoa import ViewLoanTypeSlRequest, UpdateLoanTypeSlRequest

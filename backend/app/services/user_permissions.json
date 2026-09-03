@@ -1,38 +1,85 @@
 { 
 "918642":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR", "CTR"]
 },
 "ali.inam":{
     "permissions" : ["STR", "CTR", "RCOA"]
 },
 "rafi.khan":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR", "CTR"]
 },
 "927375":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
 "talha.uzair":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR", "CTR"]
 },
 "921772":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
 "talha.irfan":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
 "928883":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
 "fiza.mansoori":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
 "928888":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
 "ammara.hattak":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR"]
 },
+
 "krishin.lal":{
-    "permissions" : ["STR", "CTR", "RCOA"]
+    "permissions" : ["STR","CTR","RCOA"]
+},
+
+"asif.mehmoud":{
+    "permissions" : ["STR","CTR"]
+},
+
+"syed.tahir1":{
+    "permissions" : ["STR", "CTR"]
+},
+
+"hunain.raza":{
+    "permissions" : ["STR"]
+},
+
+"ibad.fatima":{
+    "permissions" : ["STR"]
+},
+
+"aamir.shaikh":{
+    "permissions" : ["STR"]
+},
+
+"syed.zainali":{
+    "permissions" : ["STR"]
+},
+
+"bilal.muhammed":{
+    "permissions" : ["CTR"]
+},
+
+"wasey.khan":{
+    "permissions" : ["CTR"]
+},
+"muneeb.salem":{
+    "permissions" : ["CTR"]
+},
+"nor.fatima":{
+    "permissions" : ["CTR"]
+},
+
+"ahmed.rana":{
+    "permissions" : ["STR","CTR","RCOA"]
+},
+
+"simran.kumari":{
+    "permissions" : ["STR", "CTR"]
 }
 }

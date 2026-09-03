@@ -13,19 +13,6 @@ export interface CsvBatchGeneratorParams {
   entity_individual_flag: "ENTITY" | "INDIVIDUAL";
 }
 
-export interface XlsxGeneratorParams {
-  transaction_date: string;
-  cr_dr_flag: "DR" | "CR";
-  entity_individual_flag: "ENTITY" | "INDIVIDUAL";
-}
-
-export interface XlsxBatchGeneratorParams {
-  from_date: string;
-  to_date: string;
-  cr_dr_flag: "DR" | "CR";
-  entity_individual_flag: "ENTITY" | "INDIVIDUAL";
-}
-
 export interface Checking {
   cr_dr_flag: "DR" | "CR";
 
@@ -70,24 +57,6 @@ export const uploadFilesStream = async (form: FormData) => {
     },
   });
 };
-
-export const uploadXlsxStream = async (form: FormData) => {
-  return api.post("/xml", form, {
-    responseType: "blob",
-    headers: {
-      "Content-Type": "multipart/form-data",
-    },
-  });
-};
-
-export const uploadXlsxFilesStream = async (form: FormData) => {
-  return api.post("/xml/batch", form, {
-    responseType: "blob",
-    headers: {
-      "Content-Type": "multipart/form-data",
-    },
-  });
-};
 export const generateXml = async (formData: FormData) => {
   
   console.log("trying to post the request with params : ", formData)
@@ -109,18 +78,6 @@ export const generateCsv = async (params: CsvGeneratorParams) => {
 
 export const generateCsvBatch = async (params: CsvBatchGeneratorParams) => {
   return api.post("/csv/batch", params, {
-    responseType: "blob",
-  });
-};
-
-export const generateXlsx = async (params: XlsxGeneratorParams) => {
-  return api.post("/xlsx", params, {
-    responseType: "blob",
-  });
-};
-
-export const generateXlsxBatch = async (params: XlsxBatchGeneratorParams) => {
-  return api.post("/xlsx/batch", params, {
     responseType: "blob",
   });
 };

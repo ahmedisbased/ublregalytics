@@ -1,17 +1,7 @@
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from ..services import generate_ctr_xml, generate_ctr_csv
-from ..services.ctr import (
-    generate_ctr_csv_batch,
-    generate_ctr_xlsx,
-    generate_ctr_xlsx_batch,
-    generate_ctr_xml_batch,
-)
-from ..schemas import (
-    CsvBatchSchemaRequest,
-    CsvSchemaRequest,
-    XlsxBatchSchemaRequest,
-    XlsxSchemaRequest,
-)
+from ..services.ctr import generate_ctr_csv_batch, generate_ctr_xml_batch
+from ..schemas import CsvBatchSchemaRequest, CsvSchemaRequest
 from typing import List
 
 
@@ -54,45 +44,6 @@ async def csv_batch(request: CsvBatchSchemaRequest):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/xlsx")
-async def xlsx(request: XlsxSchemaRequest):
-    return generate_ctr_xlsx(**request.model_dump(exclude_none=True))
-
-
-@router.post("/xlsx/batch")
-async def xlsx_batch(request: XlsxBatchSchemaRequest):
-    if request.from_date > request.to_date:
-        raise HTTPException(status_code=400, detail="from_date must be before to_date")
-
-    try:
-        return generate_ctr_xlsx_batch(
-            from_date=request.from_date.isoformat(),
-            to_date=request.to_date.isoformat(),
-            cr_dr_flag=request.cr_dr_flag,
-            entity_individual_flag=request.entity_individual_flag,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/xml")
-async def xml(
-    file: UploadFile = File(...),
-    data: str = Form(...),
-):
-    return await generate_ctr_xml(file=file, data=data)
-
-
-@router.post("/xml/batch")
-async def xml_batch(
-    files: List[UploadFile] = File(...),
-    data: str = Form(...),
-):
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one XLSX file is required")
-    return await generate_ctr_xml_batch(files=files, data=data)
 
 
 @router.post("/ctr/batch")

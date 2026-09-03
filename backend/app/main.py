@@ -7,7 +7,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.staticfiles import StaticFiles
 
 from app.core import config
-from app.db import close_db_pool
+from app.db import close_db_pool, close_str_pool
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.routes import auth_router, str_router, ctr_router, rcoa_router
 
@@ -26,6 +26,7 @@ app = FastAPI(
 @app.on_event("shutdown")
 def shutdown_database_pool():
     close_db_pool()
+    close_str_pool()
 
 # Security response headers (CSP, X-Frame-Options, Referrer-Policy, etc.).
 app.add_middleware(SecurityHeadersMiddleware)

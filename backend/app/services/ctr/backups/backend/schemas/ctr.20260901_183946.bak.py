@@ -17,19 +17,6 @@ class CsvBatchSchemaRequest(BaseModel):
     entity_individual_flag: Literal["ENTITY", "INDIVIDUAL"]
 
 
-class XlsxSchemaRequest(BaseModel):
-    transaction_date: str
-    cr_dr_flag: Literal["DR", "CR"]
-    entity_individual_flag: Literal["ENTITY", "INDIVIDUAL"]
-
-
-class XlsxBatchSchemaRequest(BaseModel):
-    from_date: date
-    to_date: date
-    cr_dr_flag: Literal["DR", "CR"]
-    entity_individual_flag: Literal["ENTITY", "INDIVIDUAL"]
-
-
 class CtrSchemaRequest(BaseModel):
     file : UploadFile = File(...)
     

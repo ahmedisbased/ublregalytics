@@ -17,8 +17,14 @@ import pandas as pd
 from lxml import etree
 import copy, os
 import logging
+from typing import Any
 # from .fetch_data import fetch_data
 from .fetch_data_working import fetch_data
+from .errors import NoRecordsFound, StrGenerationError, StrProcessingError, StrTeradataError
+from .observability import add_str_log, exception_text, mask_account
+
+
+logger = logging.getLogger(__name__)
 
 ENTITY_CODES = ['3', '03','31','32','33','34','35','36','37','38']
 
@@ -72,6 +78,8 @@ def build_phones(parent, ct, comm, prefix, number):
 
 def build_address(parent, atype, addr_val, city, country, state):
     a = safe(addr_val)
+    if len(a) > 99:
+        a = a[:99]
     if not a: return
     addresses = add(parent, 'addresses')
     address = add(addresses, 'address')
@@ -168,7 +176,7 @@ def build_individual_account(parent_tag, parent, row, pfx, related_accounts_xml=
     add(acct, 'branch', safe(row.get(f'{pfx}branch', '')))
     add(acct, 'account_category', 'ACMPA')
     add(acct, 'account', safe(row.get(f'{pfx}account_', '')))
-    print(f"INSIDE BUILD INDIVIDUAL ACCOUNT AND THE PREFIX IS {pfx}")
+    logger.debug("Building individual account block with prefix %s", pfx)
     add(acct, 'iban', safe(row.get(f'{pfx}iban', '')))
     
     add(acct, 'currency_code', safe(row.get(f'{pfx}currency_code', 'PKR')))
@@ -306,12 +314,14 @@ def build_entity_account_from_query(parent_tag, parent, entity_rows, txn_row, re
 
 def build_entity_related_account(row):
     ara = etree.SubElement(etree.Element('d'), 'account_related_account')
+    logger.debug("Building entity-related account block")
     add(ara, 'account_account_relation', 'AARLO')
     acct = add(ara, 'account')
     add(acct, 'institution_name', safe(row.get('institution_name', 'UNITED BANK LIMITED')))
     add(acct, 'swift', safe(row.get('swift', 'UNILPKKA')))
     add(acct, 'branch', safe(row.get('branch', '')))
     add(acct, 'account', safe(row.get('ACCT_NUM', row.get('account_', ''))))
+    add(acct, 'iban', safe(row.get('ACCT_NUM', row.get('iban', ''))))
     add(acct, 'currency_code', safe(row.get('currency_code', 'PKR')))
     add(acct, 'account_name', safe(row.get('account_name', '')))
     biz = clean_biz(row.get('business', ''), row.get('CUST_TYPE_DESC', ''))
@@ -403,10 +413,25 @@ def build_entity_related_account_from_cbs(row):
 # ============ DATA LOADING ============
 
 
-def load_data(p_acct_no, p_trxn_no, p_date_from, p_date_to):
+def load_data(p_acct_no, p_trxn_no, p_date_from, p_date_to, logs=None):
     """Load all 5 data files"""
+    request_logs = logs if logs is not None else []
+    add_str_log(
+        request_logs,
+        logger,
+        "INFO",
+        "data_loading",
+        "Loading the five STR datasets required for XML generation.",
+        {"account": mask_account(p_acct_no)},
+    )
     # CBS_CC
-    trxns , wallet, cbs, entity, entity_detail = fetch_data(p_acct_no, p_trxn_no, p_date_from, p_date_to)
+    trxns, wallet, cbs, entity, entity_detail = fetch_data(
+        p_acct_no,
+        p_trxn_no,
+        p_date_from,
+        p_date_to,
+        logs=request_logs,
+    )
     # cbs = pd.read_csv(CBS_CC_FILE, sep='\t', dtype=str, keep_default_na=False)
     cbs.columns = [c.strip() for c in cbs.columns]
 
@@ -446,6 +471,19 @@ def load_data(p_acct_no, p_trxn_no, p_date_from, p_date_to):
     # Entity detail (MAIN_CLIENT, DIRECTOR_CLIENT, MANDATE_CLIENT) for TFMC/TTMC entity population
     entity_detail.columns = [c.strip() for c in entity_detail.columns]
 
+    add_str_log(
+        request_logs,
+        logger,
+        "INFO",
+        "data_loading",
+        "STR datasets normalized for XML generation.",
+        {
+            "transactions": len(trxns),
+            "individual_linked_rows": len(ind_linked),
+            "entity_rows": len(entity),
+            "entity_detail_rows": len(entity_detail),
+        },
+    )
     return ind_linked, entity, trxns, entity_detail
 
 def build_related_accounts(main_account, ind_linked_df, entity_df):
@@ -473,53 +511,158 @@ def build_related_accounts(main_account, ind_linked_df, entity_df):
 
 # ============ MAIN GENERATOR ============
 
-def generate_xml(main_account, transaction_number= None, from_date=None, to_date=None):
-    logging.info(f"Started query execution for account number {main_account}")
+def generate_xml(
+    main_account,
+    transaction_number=None,
+    from_date=None,
+    to_date=None,
+    logs: list[dict[str, Any]] | None = None,
+):
+    request_logs = logs if logs is not None else []
+    account_label = mask_account(main_account)
+    add_str_log(
+        request_logs,
+        logger,
+        "INFO",
+        "xml_generation",
+        "STR XML generation started.",
+        {"account": account_label, "transaction_filter": bool(transaction_number)},
+    )
 
-    ind_linked, entity, trxns, entity_detail = load_data(main_account, transaction_number, from_date, to_date)
-    logging.info(f"Completed query execution for account number {main_account}")
+    try:
+        ind_linked, entity, trxns, entity_detail = load_data(
+            main_account,
+            transaction_number,
+            from_date,
+            to_date,
+            logs=request_logs,
+        )
+    except StrGenerationError:
+        raise
+    except Exception as error:
+        add_str_log(
+            request_logs,
+            logger,
+            "ERROR",
+            "data_loading",
+            "Unexpected failure while loading STR data.",
+            {"error_type": error.__class__.__name__, "error": exception_text(error)},
+        )
+        raise StrProcessingError("data_loading", error) from error
 
-    main_str = str(main_account).strip()
-    ra_block = build_related_accounts(main_account, ind_linked, entity)
-    report = etree.Element('report')
-    for _, row in trxns.iterrows():
-        txn = add(report, 'transaction')
-        add(txn, 'transactionnumber', safe(row['transactionnumber']))
-        add(txn, 'date_transaction', safe(row['date_transaction']))
-        add(txn, 'authorized', safe(row['authorized']))
-        add(txn, 'transmode_code', safe(row['transmode_code']))
-        add(txn, 'amount_local', clean_amount(row['amount_local']))
-        tfmc_acct = safe(row.get('TFMC_account_', ''))
-        ttmc_acct = safe(row.get('TTMC_account_', ''))
-        # Related accounts go where the primary account is
-        tfmc_ra = copy.deepcopy(ra_block) if (tfmc_acct == main_str and ra_block is not None) else None
-        ttmc_ra = copy.deepcopy(ra_block) if (ttmc_acct == main_str and ra_block is not None) else None
-        # TFMC - check type from transaction, build schema accordingly
-        if is_entity(row.get('TFMC_customer_Type_code', '')):
-            # Entity detected from transaction -> use Entity Detail data if available
-            ent_col = 'ACCT_NUM' if 'ACCT_NUM' in entity_detail.columns else 'account_'
-            ent_rows = entity_detail[entity_detail[ent_col].astype(str).str.strip() == tfmc_acct] if len(entity_detail) > 0 else pd.DataFrame()
-            if len(ent_rows) > 0:
-                build_entity_account_from_query('t_from_my_client', txn, ent_rows, row, related_accounts_xml=tfmc_ra)
+    add_str_log(
+        request_logs,
+        logger,
+        "INFO",
+        "xml_generation",
+        "STR data loading completed; building XML document.",
+        {"transactions": len(trxns)},
+    )
+
+    try:
+        main_str = str(main_account).strip()
+        ra_block = build_related_accounts(main_account, ind_linked, entity)
+        related_account_count = len(ra_block) if ra_block is not None else 0
+        add_str_log(
+            request_logs,
+            logger,
+            "INFO",
+            "related_accounts",
+            "Related account section prepared.",
+            {"related_accounts": related_account_count},
+        )
+
+        report = etree.Element('report')
+        transaction_count = len(trxns)
+        add_str_log(
+            request_logs,
+            logger,
+            "INFO",
+            "transaction_build",
+            "Building transaction XML blocks.",
+            {"transaction_count": transaction_count},
+        )
+        for transaction_index, (_, row) in enumerate(trxns.iterrows(), start=1):
+            if transaction_index <= 10:
+                add_str_log(
+                    request_logs,
+                    logger,
+                    "INFO",
+                    "transaction_build",
+                    "Building transaction block.",
+                    {"transaction_number_present": bool(safe(row.get('transactionnumber', '')))},
+                )
+            elif transaction_index == 11:
+                add_str_log(
+                    request_logs,
+                    logger,
+                    "INFO",
+                    "transaction_build",
+                    "Additional transaction-level logs omitted to keep the UI readable.",
+                    {"omitted_transactions": transaction_count - 10},
+                )
+
+            txn = add(report, 'transaction')
+            add(txn, 'transactionnumber', safe(row['transactionnumber']))
+            add(txn, 'date_transaction', safe(row['date_transaction']))
+            add(txn, 'authorized', safe(row['authorized']))
+            add(txn, 'transmode_code', safe(row['transmode_code']))
+            add(txn, 'amount_local', clean_amount(row['amount_local']))
+            tfmc_acct = safe(row.get('TFMC_account_', ''))
+            ttmc_acct = safe(row.get('TTMC_account_', ''))
+            # Related accounts go where the primary account is
+            tfmc_ra = copy.deepcopy(ra_block) if (tfmc_acct == main_str and ra_block is not None) else None
+            ttmc_ra = copy.deepcopy(ra_block) if (ttmc_acct == main_str and ra_block is not None) else None
+            # TFMC - check type from transaction, build schema accordingly
+            if is_entity(row.get('TFMC_customer_Type_code', '')):
+                # Entity detected from transaction -> use Entity Detail data if available
+                ent_col = 'ACCT_NUM' if 'ACCT_NUM' in entity_detail.columns else 'account_'
+                ent_rows = entity_detail[entity_detail[ent_col].astype(str).str.strip() == tfmc_acct] if len(entity_detail) > 0 else pd.DataFrame()
+                if len(ent_rows) > 0:
+                    build_entity_account_from_query('t_from_my_client', txn, ent_rows, row, related_accounts_xml=tfmc_ra)
+                else:
+                    build_entity_account('t_from_my_client', txn, row, 'TFMC_', related_accounts_xml=tfmc_ra)
             else:
-                build_entity_account('t_from_my_client', txn, row, 'TFMC_', related_accounts_xml=tfmc_ra)
-        else:
-            build_individual_account('t_from_my_client', txn, row, 'TFMC_', related_accounts_xml=tfmc_ra, is_primary_acct=(tfmc_acct == main_str))
-        # TTMC - check type from transaction, build schema accordingly
-        if is_entity(row.get('TTMC_customer_Type_code', '')):
-            # Entity detected from transaction -> use Entity Detail data if available
-            ent_col = 'ACCT_NUM' if 'ACCT_NUM' in entity_detail.columns else 'account_'
-            ent_rows = entity_detail[entity_detail[ent_col].astype(str).str.strip() == ttmc_acct] if len(entity_detail) > 0 else pd.DataFrame()
-            if len(ent_rows) > 0:
-                build_entity_account_from_query('t_to_my_client', txn, ent_rows, row, related_accounts_xml=ttmc_ra)
+                build_individual_account('t_from_my_client', txn, row, 'TFMC_', related_accounts_xml=tfmc_ra, is_primary_acct=(tfmc_acct == main_str))
+            # TTMC - check type from transaction, build schema accordingly
+            if is_entity(row.get('TTMC_customer_Type_code', '')):
+                # Entity detected from transaction -> use Entity Detail data if available
+                ent_col = 'ACCT_NUM' if 'ACCT_NUM' in entity_detail.columns else 'account_'
+                ent_rows = entity_detail[entity_detail[ent_col].astype(str).str.strip() == ttmc_acct] if len(entity_detail) > 0 else pd.DataFrame()
+                if len(ent_rows) > 0:
+                    build_entity_account_from_query('t_to_my_client', txn, ent_rows, row, related_accounts_xml=ttmc_ra)
+                else:
+                    build_entity_account('t_to_my_client', txn, row, 'TTMC_', related_accounts_xml=ttmc_ra)
             else:
-                build_entity_account('t_to_my_client', txn, row, 'TTMC_', related_accounts_xml=ttmc_ra)
-        else:
-            build_individual_account('t_to_my_client', txn, row, 'TTMC_', related_accounts_xml=ttmc_ra, is_primary_acct=(ttmc_acct == main_str))
-    # return report
-    logging.info(f"XML genereted for account number {main_account}")
-    
-    return etree.tostring(report, encoding='unicode')
+                build_individual_account('t_to_my_client', txn, row, 'TTMC_', related_accounts_xml=ttmc_ra, is_primary_acct=(ttmc_acct == main_str))
+        xml_string = etree.tostring(report, encoding='unicode')
+    except (NoRecordsFound, StrTeradataError, StrProcessingError):
+        raise
+    except Exception as error:
+        add_str_log(
+            request_logs,
+            logger,
+            "ERROR",
+            "xml_build",
+            "XML document construction failed after data loading.",
+            {"error_type": error.__class__.__name__, "error": exception_text(error)},
+        )
+        raise StrProcessingError(
+            "xml_build",
+            error,
+            category="XML_GENERATION",
+            code="XML_GENERATION_ERROR",
+        ) from error
+
+    add_str_log(
+        request_logs,
+        logger,
+        "INFO",
+        "xml_generation",
+        "STR XML generated successfully.",
+        {"transactions": transaction_count, "xml_characters": len(xml_string)},
+    )
+    return xml_string
 
 if __name__ == '__main__':
     main_account = '326247471'

@@ -41,6 +41,125 @@
   }
 }
 
+.str-progress-panel {
+  margin-bottom: 1.5rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid #cbdce9;
+  border-radius: 0.65rem;
+  background: #f6faff;
+
+  &.error {
+    border-color: #efc1c1;
+    background: #fff8f8;
+
+    .str-progress-dot {
+      background: #c45151;
+      box-shadow: 0 0 0 0.25rem rgba(196, 81, 81, 0.12);
+    }
+  }
+}
+
+.str-progress-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+
+  strong {
+    display: block;
+    color: #183b60;
+    font-size: 0.82rem;
+  }
+
+  small {
+    max-width: 12rem;
+    color: #71849a;
+    font-size: 0.64rem;
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+}
+
+.str-progress-kicker {
+  margin: 0 0 0.15rem;
+  color: #4f78a0;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.str-progress-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 0.6rem;
+  height: 0.6rem;
+  margin-top: 0.3rem;
+  border-radius: 50%;
+  background: #4d91c3;
+  box-shadow: 0 0 0 0.25rem rgba(77, 145, 195, 0.12);
+}
+
+.str-progress-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  li {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+    color: #91a1b0;
+    font-size: 0.65rem;
+
+    span {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      width: 1.25rem;
+      height: 1.25rem;
+      border: 1px solid #cbdce9;
+      border-radius: 50%;
+      background: #fff;
+      font-size: 0.6rem;
+      font-weight: 800;
+    }
+
+    small {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    &.active {
+      color: #2f6e9f;
+      font-weight: 700;
+
+      span {
+        border-color: #4d91c3;
+        color: #fff;
+        background: #4d91c3;
+      }
+    }
+
+    &.complete {
+      color: #438676;
+
+      span {
+        border-color: #6eb29f;
+        color: #fff;
+        background: #6eb29f;
+      }
+    }
+  }
+}
+
 
 .xml-generate-btn {
   min-width: 0;
@@ -64,3 +183,18 @@
   font-size: 14px;
 }
 
+@media (max-width: 576px) {
+  .str-progress-heading {
+    flex-direction: column;
+
+    small {
+      max-width: none;
+      text-align: left;
+    }
+  }
+
+  .str-progress-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 0.55rem;
+  }
+}

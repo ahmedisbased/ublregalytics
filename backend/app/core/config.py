@@ -65,6 +65,9 @@ TERADATA_USER = _get("TERADATA_USER", "")
 TERADATA_PASSWORD = _get("TERADATA_PASSWORD", "")
 TERADATA_DATABASE = _get("TERADATA_DATABASE", "")
 TERADATA_LOGMECH = _get("TERADATA_LOGMECH", "TD2")
+TERADATA_POOL_SIZE = int(_get("TERADATA_POOL_SIZE", "3"))
+TERADATA_POOL_TIMEOUT_SECONDS = int(_get("TERADATA_POOL_TIMEOUT_SECONDS", "30"))
+TERADATA_POOL_RECYCLE_SECONDS = int(_get("TERADATA_POOL_RECYCLE_SECONDS", "1800"))
 
 # --- Misc -------------------------------------------------------------------
 # Toggle HSTS only when the app is actually served over HTTPS at the edge.

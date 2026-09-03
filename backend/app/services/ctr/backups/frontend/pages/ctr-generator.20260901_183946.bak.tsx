@@ -6,7 +6,7 @@ import {
   FaCloudUploadAlt,
   FaDownload,
   FaFileArchive,
-  FaFileExcel,
+  FaFileCsv,
   FaInfoCircle,
   FaLayerGroup,
   FaShieldAlt,
@@ -14,57 +14,17 @@ import {
   FaTrashAlt,
 } from "react-icons/fa";
 import {
-  generateXlsx,
-  generateXlsxBatch,
-  uploadXlsxStream,
-  uploadXlsxFilesStream,
+  generateCsv,
+  generateCsvBatch,
+  uploadFileStream,
+  uploadFilesStream,
 } from "../../services/ctrService";
 import "./ctr-generator.scss";
 
 type AccountType = "ENTITY" | "INDIVIDUAL";
 type TransactionType = "CR" | "DR";
-type CtrFileType = "DR_ENTITY" | "DR_INDIVIDUAL" | "CR_ENTITY" | "CR_INDIVIDUAL";
-type XlsxMode = "single" | "range";
-type WorkspaceMode = "xlsx" | "xml";
-
-type CtrFileTypeOption = {
-  key: CtrFileType;
-  transactionType: TransactionType;
-  accountType: AccountType;
-  label: string;
-  description: string;
-};
-
-const CTR_FILE_TYPES: CtrFileTypeOption[] = [
-  {
-    key: "DR_ENTITY",
-    transactionType: "DR",
-    accountType: "ENTITY",
-    label: "Withdrawal / Entity",
-    description: "DR ENTITY",
-  },
-  {
-    key: "DR_INDIVIDUAL",
-    transactionType: "DR",
-    accountType: "INDIVIDUAL",
-    label: "Withdrawal / Individual",
-    description: "DR INDIVIDUAL",
-  },
-  {
-    key: "CR_ENTITY",
-    transactionType: "CR",
-    accountType: "ENTITY",
-    label: "Deposit / Entity",
-    description: "CR ENTITY",
-  },
-  {
-    key: "CR_INDIVIDUAL",
-    transactionType: "CR",
-    accountType: "INDIVIDUAL",
-    label: "Deposit / Individual",
-    description: "CR INDIVIDUAL",
-  },
-];
+type CsvMode = "single" | "range";
+type WorkspaceMode = "csv" | "xml";
 
 type FileMetadata = {
   accountType?: AccountType;
@@ -100,7 +60,7 @@ const formatBytes = (bytes: number) => {
 };
 
 const metadataFromFilename = (filename: string): FileMetadata => {
-  const parts = filename.replace(/\.(xlsx|xlsm)$/i, "").split("_");
+  const parts = filename.replace(/\.csv$/i, "").split("_");
   const date = filename.match(/\d{4}-\d{2}-\d{2}/)?.[0];
   const accountType = parts.find(isAccountType);
   const transactionType = parts.find(isTransactionType);
@@ -208,11 +168,10 @@ const CategoryFields = ({
 );
 
 const CtrGenerator = () => {
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("xlsx");
-  const [xlsxMode, setXlsxMode] = useState<XlsxMode>("single");
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("csv");
+  const [csvMode, setCsvMode] = useState<CsvMode>("single");
   const [transactionType, setTransactionType] = useState<TransactionType>("DR");
   const [accountType, setAccountType] = useState<AccountType>("ENTITY");
-  const [selectedFileTypes, setSelectedFileTypes] = useState<CtrFileType[]>(["DR_ENTITY"]);
   const [date, setDate] = useState("");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
@@ -222,12 +181,12 @@ const CtrGenerator = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [results, setResults] = useState<Result[]>([]);
+  const [result, setResult] = useState<Result | null>(null);
 
   const clearFeedback = () => {
     setErrorMessage(null);
     setStatusMessage(null);
-    setResults([]);
+    setResult(null);
   };
 
   const switchWorkspace = (mode: WorkspaceMode) => {
@@ -243,28 +202,26 @@ const CtrGenerator = () => {
   };
 
   const addFiles = (incomingFiles: File[]) => {
-    const xlsxFiles = incomingFiles.filter((file) =>
-      file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      || file.name.toLowerCase().endsWith(".xlsx")
-      || file.name.toLowerCase().endsWith(".xlsm"),
+    const csvFiles = incomingFiles.filter((file) =>
+      file.type === "text/csv" || file.name.toLowerCase().endsWith(".csv"),
     );
 
-    if (!xlsxFiles.length) {
-      setErrorMessage("Select one or more XLSX files to continue.");
+    if (!csvFiles.length) {
+      setErrorMessage("Select one or more CSV files to continue.");
       return;
     }
 
     setSelectedFiles((currentFiles) => {
       const filesByKey = new Map(
-        [...currentFiles, ...xlsxFiles].map((file) => [fileKey(file), file]),
+        [...currentFiles, ...csvFiles].map((file) => [fileKey(file), file]),
       );
       const nextFiles = Array.from(filesByKey.values());
       applyFileMetadata(nextFiles);
       return nextFiles;
     });
     setErrorMessage(null);
-    setStatusMessage(`${xlsxFiles.length} XLSX file${xlsxFiles.length === 1 ? "" : "s"} added.`);
-    setResults([]);
+    setStatusMessage(`${csvFiles.length} CSV file${csvFiles.length === 1 ? "" : "s"} added.`);
+    setResult(null);
   };
 
   const handleFileSelection = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -281,35 +238,15 @@ const CtrGenerator = () => {
   const removeFile = (fileToRemove: File) => {
     setSelectedFiles((files) => files.filter((file) => fileKey(file) !== fileKey(fileToRemove)));
     setStatusMessage(null);
-    setResults([]);
+    setResult(null);
   };
 
-  const toggleFileType = (fileType: CtrFileType) => {
-    setSelectedFileTypes((currentTypes) => currentTypes.includes(fileType)
-      ? currentTypes.filter((currentType) => currentType !== fileType)
-      : [...currentTypes, fileType]);
-    setErrorMessage(null);
-    setStatusMessage(null);
-    setResults([]);
-  };
-
-  const selectAllFileTypes = () => {
-    setSelectedFileTypes(CTR_FILE_TYPES.map((fileType) => fileType.key));
-    setErrorMessage(null);
-    setStatusMessage(null);
-    setResults([]);
-  };
-
-  const validateXlsxRequest = () => {
-    if (xlsxMode === "single" && !date) {
+  const validateCsvRequest = () => {
+    if (csvMode === "single" && !date) {
       setErrorMessage("Choose a report date first.");
       return false;
     }
-    if (xlsxMode === "single" && !selectedFileTypes.length) {
-      setErrorMessage("Choose at least one file type.");
-      return false;
-    }
-    if (xlsxMode === "range") {
+    if (csvMode === "range") {
       if (!fromDate || !toDate) {
         setErrorMessage("Choose both the start and end dates.");
         return false;
@@ -322,84 +259,46 @@ const CtrGenerator = () => {
     return true;
   };
 
-  const handleGenerateXlsx = async () => {
+  const handleGenerateCsv = async () => {
     clearFeedback();
-    if (!validateXlsxRequest()) return;
+    if (!validateCsvRequest()) return;
 
     setIsLoading(true);
-    setStatusMessage(
-      xlsxMode === "single"
-        ? `Preparing ${selectedFileTypes.length} selected XLSX file${selectedFileTypes.length === 1 ? "" : "s"}...`
-        : "Preparing the XLSX batch...",
-    );
+    setStatusMessage(csvMode === "single" ? "Preparing your CSV..." : "Preparing the CSV batch...");
 
     try {
-      if (xlsxMode === "single") {
-        const selectedOptions = CTR_FILE_TYPES.filter((fileType) =>
-          selectedFileTypes.includes(fileType.key),
-        );
-        const responses = await Promise.allSettled(
-          selectedOptions.map((fileType) => generateXlsx({
-            transaction_date: date,
-            cr_dr_flag: fileType.transactionType,
-            entity_individual_flag: fileType.accountType,
-          })),
-        );
-        const generatedResults: Result[] = [];
-        const failedFiles: string[] = [];
-
-        for (let index = 0; index < responses.length; index += 1) {
-          const response = responses[index];
-          const fileType = selectedOptions[index];
-          if (!response || !fileType) continue;
-
-          if (response.status === "fulfilled") {
-            generatedResults.push({
-              blob: response.value.data,
-              filename: `CTR_${fileType.accountType}_${fileType.transactionType}_${date}.xlsx`,
-              title: `${fileType.label} workbook ready`,
-              detail: `${date} / ${fileType.description}`,
-            });
-          } else {
-            const reason = await readApiError(
-              response.reason,
-              "The backend could not create this workbook.",
-            );
-            failedFiles.push(`${fileType.label}: ${reason}`);
-          }
-        }
-
-        setResults(generatedResults);
-        if (failedFiles.length) {
-          setErrorMessage(
-            generatedResults.length
-              ? `Some file types could not be generated: ${failedFiles.join(" | ")}`
-              : `No files were generated: ${failedFiles.join(" | ")}`,
-          );
-          setStatusMessage(null);
-        } else {
-          setStatusMessage(
-            `${generatedResults.length} XLSX file${generatedResults.length === 1 ? "" : "s"} ready to download.`,
-          );
-        }
+      if (csvMode === "single") {
+        const response = await generateCsv({
+          transaction_date: date,
+          cr_dr_flag: transactionType,
+          entity_individual_flag: accountType,
+        });
+        const filename = `CTR_${accountType}_${transactionType}_${date}.csv`;
+        setResult({
+          blob: new Blob([response.data], { type: "text/csv" }),
+          filename,
+          title: "CSV ready",
+          detail: `${date} / ${transactionType} / ${accountType}`,
+        });
+        setStatusMessage("The source CSV is ready to download.");
       } else {
-        const response = await generateXlsxBatch({
+        const response = await generateCsvBatch({
           from_date: fromDate,
           to_date: toDate,
           cr_dr_flag: transactionType,
           entity_individual_flag: accountType,
         });
-        const filename = `CTR_XLSX_${accountType}_${transactionType}_${fromDate}_${toDate}.zip`;
-        setResults([{
+        const filename = `CTR_${accountType}_${transactionType}_${fromDate}_${toDate}.zip`;
+        setResult({
           blob: response.data,
           filename,
-          title: "XLSX batch ready",
+          title: "CSV batch ready",
           detail: `${fromDate} to ${toDate} / ${transactionType} / ${accountType}`,
-        }]);
-        setStatusMessage("The XLSX batch is ready to download.");
+        });
+        setStatusMessage("The CSV batch is ready to download.");
       }
     } catch (error) {
-      setErrorMessage(await readApiError(error, "XLSX generation failed. Please try again."));
+      setErrorMessage(await readApiError(error, "CSV generation failed. Please try again."));
       setStatusMessage(null);
     } finally {
       setIsLoading(false);
@@ -409,7 +308,7 @@ const CtrGenerator = () => {
   const handleGenerateXml = async () => {
     clearFeedback();
     if (!selectedFiles.length) {
-      setErrorMessage("Add at least one XLSX file first.");
+      setErrorMessage("Add at least one CSV file first.");
       return;
     }
 
@@ -424,7 +323,7 @@ const CtrGenerator = () => {
     setStatusMessage(
       selectedFiles.length === 1
         ? "Building the XML package..."
-        : `Building one XML package from ${selectedFiles.length} XLSX files...`,
+        : `Building one XML package from ${selectedFiles.length} CSV files...`,
     );
 
     try {
@@ -438,14 +337,14 @@ const CtrGenerator = () => {
       if (selectedFiles.length === 1) {
         formData.append("file", selectedFiles[0]);
         formData.append("data", metadataPayload);
-        const response = await uploadXlsxStream(formData);
+        const response = await uploadFileStream(formData);
         const filename = `CTR_XML_${accountType}_${transactionType}.zip`;
-        setResults([{
+        setResult({
           blob: response.data,
           filename,
           title: "XML package ready",
           detail: `${selectedFiles[0].name} converted successfully`,
-        }]);
+        });
       } else {
         const categorySummary = batchCategorySummary(
           selectedFiles,
@@ -454,14 +353,14 @@ const CtrGenerator = () => {
         );
         selectedFiles.forEach((file) => formData.append("files", file));
         formData.append("data", metadataPayload);
-        const response = await uploadXlsxFilesStream(formData);
+        const response = await uploadFilesStream(formData);
         const filename = `CTR_XML_BATCH_${categorySummary.accounts}_${categorySummary.directions}.zip`;
-        setResults([{
+        setResult({
           blob: response.data,
           filename,
           title: "XML batch ready",
-          detail: `${selectedFiles.length} XLSX files converted: ${categorySummary.directions}`,
-        }]);
+          detail: `${selectedFiles.length} CSV files converted: ${categorySummary.directions}`,
+        });
       }
       setStatusMessage("The XML package is ready to download.");
     } catch (error) {
@@ -487,7 +386,7 @@ const CtrGenerator = () => {
               <p className="ctr-overline">Cash Transaction Report</p>
               <h1>Prepare clean source data, then ship compliant XML.</h1>
               <p className="ctr-hero-copy">
-                Generate daily or range-based XLSX packages and convert one or many source files
+                Generate daily or range-based CSV packages and convert one or many source files
                 into a single downloadable XML archive.
               </p>
             </div>
@@ -513,15 +412,15 @@ const CtrGenerator = () => {
             <ol className="ctr-steps">
               <li>
                 <span className="ctr-step-number">01</span>
-                <div><strong>Set the file types</strong><span>Choose one or more direction and account combinations.</span></div>
+                <div><strong>Set the category</strong><span>Choose direction and account profile.</span></div>
               </li>
               <li>
                 <span className="ctr-step-number">02</span>
-                <div><strong>Generate or upload</strong><span>Work with one date, a date range, or an XLSX set.</span></div>
+                <div><strong>Generate or upload</strong><span>Work with one date, a date range, or a CSV set.</span></div>
               </li>
               <li>
                 <span className="ctr-step-number">03</span>
-                <div><strong>Download the package</strong><span>Receive an XLSX workbook, XLSX ZIP, or XML ZIP.</span></div>
+                <div><strong>Download the package</strong><span>Receive a CSV, CSV ZIP, or XML ZIP.</span></div>
               </li>
             </ol>
             <div className="ctr-guide-note">
@@ -542,13 +441,13 @@ const CtrGenerator = () => {
             <div className="ctr-workspace-tabs" role="tablist" aria-label="CTR workflow">
               <button
                 type="button"
-                className={workspaceMode === "xlsx" ? "active" : ""}
-                onClick={() => switchWorkspace("xlsx")}
+                className={workspaceMode === "csv" ? "active" : ""}
+                onClick={() => switchWorkspace("csv")}
                 role="tab"
-                aria-selected={workspaceMode === "xlsx"}
+                aria-selected={workspaceMode === "csv"}
               >
-                <FaFileExcel />
-                <span><strong>Prepare XLSX</strong><small>Generate text-safe workbooks</small></span>
+                <FaFileCsv />
+                <span><strong>Prepare CSV</strong><small>Generate source files</small></span>
               </button>
               <button
                 type="button"
@@ -558,102 +457,68 @@ const CtrGenerator = () => {
                 aria-selected={workspaceMode === "xml"}
               >
                 <FaFileArchive />
-                <span><strong>Build XML</strong><small>Convert one or many XLSX files</small></span>
+                <span><strong>Build XML</strong><small>Convert one or many CSVs</small></span>
               </button>
             </div>
 
             {errorMessage && <div className="ctr-alert error" role="alert">{errorMessage}</div>}
             {statusMessage && !errorMessage && <div className="ctr-alert status"><FaCheckCircle /> {statusMessage}</div>}
 
-            {workspaceMode === "xlsx" ? (
-              <section className="ctr-section" aria-labelledby="xlsx-heading">
+            {workspaceMode === "csv" ? (
+              <section className="ctr-section" aria-labelledby="csv-heading">
                 <div className="ctr-section-heading">
-                  <span className="ctr-section-icon blue"><FaFileExcel /></span>
+                  <span className="ctr-section-icon blue"><FaFileCsv /></span>
                   <div>
                     <p className="ctr-overline">Source data</p>
-                    <h3 id="xlsx-heading">Generate XLSX output</h3>
-                    <p>Pull one report day into one or more text-safe workbooks, or package a short date range into a ZIP.</p>
+                    <h3 id="csv-heading">Generate CSV output</h3>
+                    <p>Pull one report day or package a short date range into a ZIP.</p>
                   </div>
                 </div>
 
-                <div className="ctr-choice-row" role="group" aria-label="XLSX generation mode">
-                  <button type="button" className={xlsxMode === "single" ? "selected" : ""} onClick={() => setXlsxMode("single")}>
+                <div className="ctr-choice-row" role="group" aria-label="CSV generation mode">
+                  <button type="button" className={csvMode === "single" ? "selected" : ""} onClick={() => setCsvMode("single")}>
                     <span className="ctr-choice-mark">01</span>
-                    <span><strong>Single date</strong><small>One date, selected file types</small></span>
+                    <span><strong>Single date</strong><small>One CSV file</small></span>
                   </button>
-                  <button type="button" className={xlsxMode === "range" ? "selected" : ""} onClick={() => setXlsxMode("range")}>
+                  <button type="button" className={csvMode === "range" ? "selected" : ""} onClick={() => setCsvMode("range")}>
                     <span className="ctr-choice-mark">02</span>
-                    <span><strong>Date range</strong><small>Multiple XLSX files in a ZIP</small></span>
+                    <span><strong>Date range</strong><small>Multiple CSVs in a ZIP</small></span>
                   </button>
                 </div>
 
-                {xlsxMode === "single" ? (
-                  <div className="ctr-form-grid">
+                <div className="ctr-form-grid">
+                  {csvMode === "single" ? (
                     <label className="ctr-field">
                       <span className="ctr-field-label"><FaCalendarAlt /> Report date</span>
                       <input type="date" value={date} onChange={(event) => setDate(event.target.value)} />
-                      <span className="ctr-field-hint">The selected date is used for every file type.</span>
+                      <span className="ctr-field-hint">Select the reporting day to query.</span>
                     </label>
-                    <fieldset className="ctr-file-type-field">
-                      <legend>File types <em>choose one or more</em></legend>
-                      <div className="ctr-file-type-options">
-                        {CTR_FILE_TYPES.map((fileType) => (
-                          <label
-                            className={`ctr-file-type-option ${selectedFileTypes.includes(fileType.key) ? "selected" : ""}`}
-                            key={fileType.key}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={selectedFileTypes.includes(fileType.key)}
-                              onChange={() => toggleFileType(fileType.key)}
-                            />
-                            <span>
-                              <strong>{fileType.label}</strong>
-                              <small>{fileType.description}</small>
-                            </span>
-                          </label>
-                        ))}
-                      </div>
-                      <div className="ctr-file-type-actions">
-                        <span>{selectedFileTypes.length} of {CTR_FILE_TYPES.length} selected</span>
-                        <button
-                          type="button"
-                          onClick={selectAllFileTypes}
-                          disabled={selectedFileTypes.length === CTR_FILE_TYPES.length}
-                        >
-                          Select all
-                        </button>
-                      </div>
-                    </fieldset>
-                  </div>
-                ) : (
-                  <div className="ctr-form-grid">
-                    <label className="ctr-field">
-                      <span className="ctr-field-label"><FaCalendarAlt /> Start date</span>
-                      <input type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} />
-                      <span className="ctr-field-hint">The first day in the package.</span>
-                    </label>
-                    <label className="ctr-field">
-                      <span className="ctr-field-label"><FaCalendarAlt /> End date</span>
-                      <input type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />
-                      <span className="ctr-field-hint">Maximum range: 31 days.</span>
-                    </label>
-                    <CategoryFields
-                      transactionType={transactionType}
-                      accountType={accountType}
-                      onTransactionTypeChange={setTransactionType}
-                      onAccountTypeChange={setAccountType}
-                    />
-                  </div>
-                )}
+                  ) : (
+                    <>
+                      <label className="ctr-field">
+                        <span className="ctr-field-label"><FaCalendarAlt /> Start date</span>
+                        <input type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} />
+                        <span className="ctr-field-hint">The first day in the package.</span>
+                      </label>
+                      <label className="ctr-field">
+                        <span className="ctr-field-label"><FaCalendarAlt /> End date</span>
+                        <input type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} />
+                        <span className="ctr-field-hint">Maximum range: 31 days.</span>
+                      </label>
+                    </>
+                  )}
+                  <CategoryFields
+                    transactionType={transactionType}
+                    accountType={accountType}
+                    onTransactionTypeChange={setTransactionType}
+                    onAccountTypeChange={setAccountType}
+                  />
+                </div>
 
                 <div className="ctr-action-row">
-                  <div>
-                    <strong>{xlsxMode === "single" ? `${selectedFileTypes.length} selected file type${selectedFileTypes.length === 1 ? "" : "s"}` : "Range package"}</strong>
-                    <span>{xlsxMode === "single" ? "Each selected type uses the same report date." : "Each day is returned as its own XLSX workbook."}</span>
-                  </div>
-                  <button type="button" className="ctr-primary-button" onClick={handleGenerateXlsx} disabled={isLoading}>
-                    {isLoading ? "Working..." : xlsxMode === "single" ? "Generate selected XLSX" : "Generate XLSX batch"}
+                  <div><strong>{csvMode === "single" ? "One source file" : "Range package"}</strong><span>{csvMode === "single" ? "Ready when you are." : "Each day is returned as its own CSV."}</span></div>
+                  <button type="button" className="ctr-primary-button" onClick={handleGenerateCsv} disabled={isLoading}>
+                    {isLoading ? "Working..." : csvMode === "single" ? "Generate CSV" : "Generate CSV batch"}
                     {!isLoading && <FaArrowRight />}
                   </button>
                 </div>
@@ -664,8 +529,8 @@ const CtrGenerator = () => {
                   <span className="ctr-section-icon violet"><FaFileArchive /></span>
                   <div>
                     <p className="ctr-overline">XML conversion</p>
-                    <h3 id="xml-heading">Upload source XLSX files</h3>
-                    <p>Drop one workbook for the existing flow, or select a complete date-range batch.</p>
+                    <h3 id="xml-heading">Upload source CSVs</h3>
+                    <p>Drop one file for the existing flow, or select a complete date-range batch.</p>
                   </div>
                 </div>
 
@@ -675,21 +540,21 @@ const CtrGenerator = () => {
                   onDragLeave={() => setIsDragging(false)}
                   onDrop={handleDrop}
                 >
-                  <input type="file" accept=".xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple onChange={handleFileSelection} />
+                  <input type="file" accept=".csv,text/csv" multiple onChange={handleFileSelection} />
                   <span className="ctr-upload-icon"><FaCloudUploadAlt /></span>
-                  <strong>Drop XLSX files here</strong>
+                  <strong>Drop CSV files here</strong>
                   <span>or browse from your computer</span>
                   <small>Filenames with dates are detected automatically.</small>
                 </label>
 
                 {selectedFiles.length > 0 && (
-                  <div className="ctr-file-list" aria-label="Selected XLSX files">
-                    <div className="ctr-file-list-heading"><span>{selectedFiles.length} workbook{selectedFiles.length === 1 ? "" : "s"} selected</span><button type="button" onClick={() => setSelectedFiles([])}>Clear all</button></div>
+                  <div className="ctr-file-list" aria-label="Selected CSV files">
+                    <div className="ctr-file-list-heading"><span>{selectedFiles.length} file{selectedFiles.length === 1 ? "" : "s"} selected</span><button type="button" onClick={() => setSelectedFiles([])}>Clear all</button></div>
                     {selectedFiles.map((file) => {
                       const metadata = metadataFromFilename(file.name);
                       return (
                         <div className="ctr-file-row" key={fileKey(file)}>
-                          <span className="ctr-file-symbol"><FaFileExcel /></span>
+                          <span className="ctr-file-symbol"><FaFileCsv /></span>
                           <span className="ctr-file-details"><strong>{file.name}</strong><small>{formatBytes(file.size)}{metadata.date ? ` / ${metadata.date}` : " / date from fallback"}</small></span>
                           <span className="ctr-file-tags" aria-label="Detected category">
                             <span className={`ctr-file-tag ${metadata.transactionType === "CR" ? "credit" : "debit"}`}>{metadata.transactionType ?? transactionType}</span>
@@ -712,12 +577,12 @@ const CtrGenerator = () => {
                   <label className="ctr-field">
                     <span className="ctr-field-label"><FaCalendarAlt /> Fallback report date <em>optional</em></span>
                     <input type="date" value={uploadDate} onChange={(event) => setUploadDate(event.target.value)} />
-                    <span className="ctr-field-hint">Used only when an XLSX filename has no date.</span>
+                    <span className="ctr-field-hint">Used only when a CSV filename has no date.</span>
                   </label>
                 </div>
 
                 <div className="ctr-action-row">
-                  <div><strong>{selectedFiles.length > 1 ? "Batch XML conversion" : "Single XML conversion"}</strong><span>{selectedFiles.length > 1 ? "All valid workbooks will be combined into one ZIP." : "The original single-file endpoint remains unchanged."}</span></div>
+                  <div><strong>{selectedFiles.length > 1 ? "Batch XML conversion" : "Single XML conversion"}</strong><span>{selectedFiles.length > 1 ? "All valid files will be combined into one ZIP." : "The original single-file endpoint remains unchanged."}</span></div>
                   <button type="button" className="ctr-primary-button violet-button" onClick={handleGenerateXml} disabled={isLoading || !selectedFiles.length}>
                     {isLoading ? "Working..." : selectedFiles.length > 1 ? "Build XML batch" : "Build XML"}
                     {!isLoading && <FaArrowRight />}
@@ -726,27 +591,11 @@ const CtrGenerator = () => {
               </section>
             )}
 
-            {results.length > 0 && (
-              <section className="ctr-results" aria-live="polite">
-                <div className="ctr-results-heading">
-                  <p className="ctr-overline">Ready for download</p>
-                  <h3>{results.length} file{results.length === 1 ? "" : "s"} generated</h3>
-                  <span>Download each file below. The category is included in every filename.</span>
-                </div>
-                <div className="ctr-results-list">
-                  {results.map((item) => (
-                    <div className="ctr-result" key={item.filename}>
-                      <span className="ctr-result-icon"><FaCheckCircle /></span>
-                      <div>
-                        <strong className="ctr-result-title">{item.title}</strong>
-                        <span>{item.detail}</span>
-                      </div>
-                      <button type="button" className="ctr-download-button" onClick={() => downloadBlob(item.blob, item.filename)}>
-                        <FaDownload /> Download
-                      </button>
-                    </div>
-                  ))}
-                </div>
+            {result && (
+              <section className="ctr-result" aria-live="polite">
+                <span className="ctr-result-icon"><FaCheckCircle /></span>
+                <div><p className="ctr-overline">Ready for download</p><h3>{result.title}</h3><span>{result.detail}</span></div>
+                <button type="button" className="ctr-download-button" onClick={() => downloadBlob(result.blob, result.filename)}><FaDownload /> Download</button>
               </section>
             )}
           </main>

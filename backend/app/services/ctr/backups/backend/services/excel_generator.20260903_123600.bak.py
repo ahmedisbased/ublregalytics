@@ -792,7 +792,6 @@ def _read_ctr_csv_bytes(contents):
                 keep_default_na=False,
                 low_memory=False,
             )
-            dataframe.columns = [str(column).strip() for column in dataframe.columns]
             return dataframe, encoding
         except (
             UnicodeDecodeError,
@@ -814,7 +813,6 @@ def _read_ctr_xlsx_bytes(contents):
             dtype=str,
             keep_default_na=False,
         )
-        dataframe.columns = [str(column).strip() for column in dataframe.columns]
     except Exception as exc:
         raise ValueError("The uploaded file is not a readable XLSX workbook") from exc
     return dataframe, "xlsx"
@@ -926,33 +924,6 @@ def _write_ctr_xml_chunks(
         if archive_dir:
             file_name = f"{archive_dir}/{file_name}"
         zip_file.writestr(file_name, xml)
-
-
-def _xml_zip_from_dataframe(
-    dataframe,
-    transaction_date,
-    cr_dr_flag,
-    entity_individual_flag,
-):
-    case = _ctr_case(cr_dr_flag, entity_individual_flag)
-    if case is None:
-        raise ValueError("Invalid CTR transaction or account type")
-    if dataframe is None or dataframe.empty or len(dataframe.columns) <= 1:
-        raise ValueError("No data found for the given criteria")
-
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        _write_ctr_xml_chunks(
-            zip_file=zip_file,
-            dataframe=dataframe.fillna(""),
-            transaction_date=transaction_date,
-            case=case,
-            cr_dr_flag=cr_dr_flag,
-            entity_individual_flag=entity_individual_flag,
-        )
-
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
 
 
 def generate_ctr_csv_batch(
@@ -1218,7 +1189,7 @@ async def generate_ctr_xml_batch(files, data):
 
     if not processed_files:
         return Response(
-            content="No usable XLSX files were found",
+            content="No usable CSV files were found",
             status_code=404,
             media_type="text/plain",
         )
@@ -1318,6 +1289,14 @@ async def generate_ctr_xml_xlsx(file: UploadFile, data: str):
             media_type="text/plain",
         )
 
+    case = _ctr_case(parsed_data.cr_dr_flag, parsed_data.entity_individual_flag)
+    if case is None:
+        return Response(
+            content="Invalid CTR transaction or account type",
+            status_code=400,
+            media_type="text/plain",
+        )
+
     try:
         dataframe, _ = _read_ctr_xlsx_bytes(await file.read())
     except ValueError as exc:
@@ -1329,12 +1308,6 @@ async def generate_ctr_xml_xlsx(file: UploadFile, data: str):
             status_code=404,
             media_type="text/plain",
         )
-    category = _category_from_ctr_filename(file.filename)
-    cr_dr_flag = category["cr_dr_flag"] or parsed_data.cr_dr_flag
-    entity_individual_flag = (
-        category["entity_individual_flag"]
-        or parsed_data.entity_individual_flag
-    )
     transaction_date = _date_from_ctr_filename(file.filename)
     if not transaction_date:
         transaction_date = parsed_data.transaction_date or ""
@@ -1347,22 +1320,24 @@ async def generate_ctr_xml_xlsx(file: UploadFile, data: str):
             media_type="text/plain",
         )
 
-    try:
-        xml_zip = _xml_zip_from_dataframe(
-            dataframe=dataframe,
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        _write_ctr_xml_chunks(
+            zip_file=zip_file,
+            dataframe=dataframe.fillna(""),
             transaction_date=transaction_date,
-            cr_dr_flag=cr_dr_flag,
-            entity_individual_flag=entity_individual_flag,
+            case=case,
+            cr_dr_flag=parsed_data.cr_dr_flag,
+            entity_individual_flag=parsed_data.entity_individual_flag,
         )
-    except ValueError as exc:
-        return Response(content=str(exc), status_code=400, media_type="text/plain")
 
+    zip_buffer.seek(0)
     output_name = (
-        f"CTR_XML_{entity_individual_flag}_"
-        f"{cr_dr_flag}_{transaction_date}.zip"
+        f"CTR_XML_{parsed_data.entity_individual_flag}_"
+        f"{parsed_data.cr_dr_flag}_{transaction_date}.zip"
     )
     return Response(
-        content=xml_zip,
+        content=zip_buffer.getvalue(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{output_name}"'},
     )
@@ -1423,30 +1398,77 @@ async def generate_ctr_xml(file : UploadFile = File(...),
     
 
 
-    category = _category_from_ctr_filename(file.filename)
-    cr_dr_flag = category["cr_dr_flag"] or cr_dr_flag
-    entity_individual_flag = (
-        category["entity_individual_flag"]
-        or entity_individual_flag
-    )
-    transaction_date = (
-        _date_from_ctr_filename(file.filename)
-        or transaction_date
-        or ""
-    )
+    case = None
+    if cr_dr_flag == 'DR' and entity_individual_flag == 'INDIVIDUAL':
+        case = 'individual_withdrawal'
+    elif cr_dr_flag == 'CR' and entity_individual_flag == 'INDIVIDUAL':
+        case = 'individual_deposit'
+    elif cr_dr_flag == 'DR' and entity_individual_flag == 'ENTITY':
+        case = 'entity_withdrawal'
+    elif cr_dr_flag == 'CR' and entity_individual_flag == 'ENTITY':
+        case = 'entity_deposit'
+    elif entity_individual_flag == 'individual' and cr_dr_flag == 'debit':
+        case = 'individual_withdrawal'
 
-    try:
-        xml_zip = _xml_zip_from_dataframe(
-            dataframe=df,
-            transaction_date=transaction_date,
-            cr_dr_flag=cr_dr_flag,
-            entity_individual_flag=entity_individual_flag,
+
+
+    if len(df.columns) == 1:
+         return Response(
+            content = "No data found for the given criteria",
+            status_code = 404,
+            media_type = "text/plain"
         )
-    except ValueError as exc:
-        return Response(content=str(exc), status_code=400, media_type="text/plain")
+    elif df.empty:
+        return Response(
+            content = "No data found for the given criteria",
+            status_code = 404,
+            media_type = "text/plain"
+        )
+        
+    print(f"csv has been created and saved as output_file.csv")
+    zip_buffer = BytesIO()
 
+    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+
+        for split_num, start in enumerate(range(0, len(df), CHUNK_SIZE), start=1):
+
+            chunk_df = df.iloc[start:start + CHUNK_SIZE]
+
+            xml = build_report_header(transaction_date)
+            xml += build_reporting_person()
+            xml += build_location()
+
+            build_transaction = BUILDERS[case]
+
+            for _, row in chunk_df.iterrows():
+                xml += build_transaction(row)
+
+            xml += "</report>"
+
+            file_name = create_file_name(
+                transaction_date,
+                cr_dr_flag,
+                entity_individual_flag,
+                split_num
+            )
+            
+            zip_file.writestr(file_name, xml)
+
+    # print(f"xml final is {xml}")
+
+    
+    output_dir = r"C:\Regalytics\CTR\ctr_backend\generated_xml_ahmed"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    os.makedirs(output_dir, exist_ok = True)
+
+    zip_buffer.seek(0)
+    saved_file_path = os.path.join(output_dir, f"{file_name}_{timestamp}.xml")
+    with open(saved_file_path, "wb") as f:
+        f.write(zip_buffer.getvalue())
+    
     return Response(
-        content=xml_zip,
+        content=zip_buffer.getvalue(),
         media_type="application/zip",
         headers={
             "Content-Disposition":
