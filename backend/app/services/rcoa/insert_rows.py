@@ -244,6 +244,12 @@ def insert_tfcs_sukus(
     rcoa_code: str,
     conn,
 ):
+    if any(character.isdigit() for character in cust_name):
+        raise HTTPException(
+            detail="Customer name must not contain numbers.",
+            status_code=422,
+        )
+
     start_timestamp, start_date_value = _date_values(start_date)
     return _insert_row(
         conn=conn,

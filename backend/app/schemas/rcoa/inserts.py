@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
-from .validation import NUMERIC_CODE_PATTERN
+from .validation import CUSTOMER_NAME_PATTERN, NUMERIC_CODE_PATTERN
 
 
 class InsertAdjustmentsFormatRequest(BaseModel):
@@ -26,5 +26,5 @@ class InsertRcoaManualDataRequest(BaseModel):
 class InsertTfcsSukusRequest(BaseModel):
     start_date: str
     loan_no: str = Field(pattern=NUMERIC_CODE_PATTERN)
-    cust_name: str
+    cust_name: str = Field(pattern=CUSTOMER_NAME_PATTERN)
     rcoa_code: str = Field(pattern=NUMERIC_CODE_PATTERN)

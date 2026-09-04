@@ -69,6 +69,12 @@ def update_tfcs_sukus_mapping_service(
     rcoa_code: str | None,
     conn,
 ):
+    if cust_name is not None and any(character.isdigit() for character in cust_name):
+        raise HTTPException(
+            detail="Customer name must not contain numbers.",
+            status_code=422,
+        )
+
     updates = []
     verification_conditions = [
         f"LOAN_NO = '{loan_no}'",

@@ -167,6 +167,10 @@ const isNumericDraftValue = (field: EditorField, value: string, allowPartial = f
         : /^-?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value);
 };
 
+const isCustomerNameField = (field: EditorField) => field.key === 'cust_name';
+
+const hasDigits = (value: string) => /\d/.test(value);
+
 const getEditorInputType = (field: EditorField) => field.type === 'number' ? 'text' : field.type ?? 'text';
 
 const getDraftForFields = (row: RcoaRow, fields: EditorField[]) => fields.reduce<Record<string, string>>(
@@ -350,16 +354,23 @@ const modeLabels: Record<RcoaMode, RcoaModeDefinition> = {
             { key: 'cust_name', label: 'Customer name' },
             { key: 'rcoa_code', label: 'RCOA code', type: 'number', step: '1' },
         ],
-        buildInsertPayload: (draft, date) => ({
-            start_date: date,
-            loan_no: requiredDraftValue(draft, 'loan_no', 'Loan number'),
-            cust_name: requiredDraftValue(draft, 'cust_name', 'Customer name'),
-            rcoa_code: requiredDraftValue(draft, 'rcoa_code', 'RCOA code'),
-        }),
+        buildInsertPayload: (draft, date) => {
+            const customerName = requiredDraftValue(draft, 'cust_name', 'Customer name');
+            if (hasDigits(customerName)) throw new Error('Customer name must not contain numbers.');
+            return {
+                start_date: date,
+                loan_no: requiredDraftValue(draft, 'loan_no', 'Loan number'),
+                cust_name: customerName,
+                rcoa_code: requiredDraftValue(draft, 'rcoa_code', 'RCOA code'),
+            };
+        },
         getRowKey: (row) => getRowKey(row, ['LOAN_NO', 'START_DATE']),
         buildPayload: (row, draft, date) => {
             const custName = draft.cust_name?.trim() ?? '';
             const rcoaCode = draft.rcoa_code?.trim() ?? '';
+            if (hasDigits(custName)) {
+                throw new Error('Customer name must not contain numbers.');
+            }
             if (!custName && !rcoaCode) {
                 throw new Error('Enter a customer name or RCOA code before saving.');
             }
@@ -836,8 +847,9 @@ const Rcoa = () => {
     };
 
     const updateEditorDraft = (field: EditorField, value: string) => {
-        if (!isNumericDraftValue(field, value, true)) return;
-        updateDraft(field.key, value);
+        const normalizedValue = isCustomerNameField(field) ? value.replace(/\d/g, '') : value;
+        if (!isNumericDraftValue(field, normalizedValue, true)) return;
+        updateDraft(field.key, normalizedValue);
     };
 
     const buildPendingChange = (): PendingChange | null => {
@@ -856,6 +868,9 @@ const Rcoa = () => {
             const value = draft[field.key]?.trim() ?? '';
             if (value && !isNumericDraftValue(field, value)) {
                 throw new Error(`${field.label} must be numeric.`);
+            }
+            if (isCustomerNameField(field) && hasDigits(value)) {
+                throw new Error('Customer name must not contain numbers.');
             }
         });
 
@@ -973,8 +988,9 @@ const Rcoa = () => {
 
     const updateInsertDraft = (field: EditorField, value: string) => {
         if (isInsertSaving) return;
-        if (!isNumericDraftValue(field, value, true)) return;
-        setInsertDraft((current) => ({ ...current, [field.key]: value }));
+        const normalizedValue = isCustomerNameField(field) ? value.replace(/\d/g, '') : value;
+        if (!isNumericDraftValue(field, normalizedValue, true)) return;
+        setInsertDraft((current) => ({ ...current, [field.key]: normalizedValue }));
     };
 
     const handleInsert = async () => {
@@ -986,6 +1002,9 @@ const Rcoa = () => {
                 const value = insertDraft[field.key]?.trim() ?? '';
                 if (!value) throw new Error(`${field.label} is required.`);
                 if (!isNumericDraftValue(field, value)) throw new Error(`${field.label} must be numeric.`);
+                if (isCustomerNameField(field) && hasDigits(value)) {
+                    throw new Error('Customer name must not contain numbers.');
+                }
             });
 
             const payload = definition.buildInsertPayload(insertDraft, appliedDate);

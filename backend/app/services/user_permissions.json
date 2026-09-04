@@ -1,6 +1,6 @@
 { 
 "918642":{
-    "permissions" : ["STR", "CTR"]
+    "permissions" : ["STR", "CTR", "RCOA"]
 },
 "ali.inam":{
     "permissions" : ["STR", "CTR", "RCOA"]

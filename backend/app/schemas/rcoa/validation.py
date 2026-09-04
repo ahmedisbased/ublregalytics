@@ -1,1 +1,2 @@
 NUMERIC_CODE_PATTERN = r"^\d+$"
+CUSTOMER_NAME_PATTERN = r"^[^0-9]*$"

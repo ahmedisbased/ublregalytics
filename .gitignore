@@ -4,7 +4,7 @@ backend/venv_backup
 backend/app/.env
 *.pem
 backend/keys
-
+backend/wheelhouse
 # Secrets & environment (Frontend)
 frontend/node_modules
 

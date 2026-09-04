@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, model_validator
 
-from .validation import NUMERIC_CODE_PATTERN
+from .validation import CUSTOMER_NAME_PATTERN, NUMERIC_CODE_PATTERN
 
 
 class ViewTfcsSukusMappingRequest(BaseModel):
@@ -12,7 +12,7 @@ class ViewTfcsSukusMappingRequest(BaseModel):
 class UpdateTfcsSukusMappingRequest(BaseModel):
     loan_no: str = Field(pattern=NUMERIC_CODE_PATTERN)
     start_date: str
-    cust_name: str | None = None
+    cust_name: str | None = Field(default=None, pattern=CUSTOMER_NAME_PATTERN)
     rcoa_code: str | None = Field(default=None, pattern=NUMERIC_CODE_PATTERN)
 
     @model_validator(mode="after")
