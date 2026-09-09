@@ -6,7 +6,7 @@
     "permissions" : ["STR", "CTR", "RCOA"]
 },
 "rafi.khan":{
-    "permissions" : ["STR", "CTR"]
+    "permissions" : ["STR", "CTR","RCOA"]
 },
 "927375":{
     "permissions" : ["STR"]

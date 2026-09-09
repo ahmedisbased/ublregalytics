@@ -1,7 +1,11 @@
 import teradatasql
 from fastapi import HTTPException
 
+from ...schemas.rcoa.metadata import table_search_columns, table_select_list
 from .query_helpers import search_condition
+
+
+GL_SL_MAPPING_TABLE = "DT_SDMT_UBL.GL_SL_MAPPING"
 
 """
 GL SL MAPPING FILE WHERE ONLY THE SL_CODE SHOULD BE CHANGED
@@ -12,7 +16,7 @@ def update_gl_sl_mapping(sl_code : str, gl_edw_id : str, cury_edw_id : str, star
         cursor = conn.cursor()
       
         query = f"""
-            UPDATE DT_SDMT_UBL.GL_SL_MAPPING
+            UPDATE {GL_SL_MAPPING_TABLE}
             SET SL_CODE = '{sl_code}',
                 UPDATE_DATE = CURRENT_DATE,
                 UPDATE_TS = CURRENT_TIMESTAMP
@@ -25,7 +29,7 @@ def update_gl_sl_mapping(sl_code : str, gl_edw_id : str, cury_edw_id : str, star
 
         # making a select query to check if the update has been made or not.
         query = f"""
-            SELECT * FROM DT_SDMT_UBL.GL_SL_MAPPING
+            SELECT {table_select_list(GL_SL_MAPPING_TABLE)} FROM {GL_SL_MAPPING_TABLE}
             WHERE SL_CODE = '{sl_code}'
             AND GL_EDW_ID = '{gl_edw_id}'
             AND CURY_EDW_ID = '{cury_edw_id}'
@@ -56,19 +60,19 @@ def view_gl_sl_mapping(
         cursor = conn.cursor()
         start = (page - 1) * limit + 1
         end = page * limit
-        query = f"""SELECT * FROM 
-        DT_SDMT_UBL.GL_SL_MAPPING
-        WHERE START_DATE = '{date}'
-        {search_condition(search, ['GL_EDW_ID', 'GL_DESCRIPTION', 'CURY_EDW_ID', 'SL_CODE'])}
+        query = f"""SELECT {table_select_list(GL_SL_MAPPING_TABLE)} FROM
+         {GL_SL_MAPPING_TABLE}
+         WHERE START_DATE = '{date}'
+         {search_condition(search, table_search_columns(GL_SL_MAPPING_TABLE, ['GL_EDW_ID', 'GL_DESCRIPTION', 'CURY_EDW_ID', 'SL_CODE']))}
         QUALIFY ROW_NUMBER() OVER(ORDER BY GL_EDW_ID, CURY_EDW_ID) BETWEEN {start} AND {end};"""
         cursor.execute(query)
         print(query)
         rows = cursor.fetchall()       
         count_query = f"""
             SELECT COUNT(*)
-            FROM DT_SDMT_UBL.GL_SL_MAPPING
+            FROM {GL_SL_MAPPING_TABLE}
             WHERE START_DATE = '{date}'
-            {search_condition(search, ['GL_EDW_ID', 'GL_DESCRIPTION', 'CURY_EDW_ID', 'SL_CODE'])}
+            {search_condition(search, table_search_columns(GL_SL_MAPPING_TABLE, ['GL_EDW_ID', 'GL_DESCRIPTION', 'CURY_EDW_ID', 'SL_CODE']))}
         """
         cursor2 = conn.cursor()
         

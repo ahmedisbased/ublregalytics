@@ -6,8 +6,15 @@ import re
 import teradatasql
 from fastapi import HTTPException
 
+from ...schemas.rcoa.metadata import table_column_sql_name
+from ...schemas.rcoa.validation import is_ascii_letters
+
 
 logger = logging.getLogger(__name__)
+
+ADJUSTMENTS_TABLE = "DT_SDMT_UBL.RCOA_SL_WISE_ADJ"
+MANUAL_DATA_TABLE = "DT_SDMT_UBL.RCOA_MANUAL_DATA"
+ADVANCES_TABLE = "DT_SDMT_UBL.RCOA_ADVANCES_MAPPING"
 
 
 def _sql_text(value: str) -> str:
@@ -30,6 +37,14 @@ def _date_values(start_date: str) -> tuple[str, str]:
         f"CAST(CAST({escaped_date} AS DATE) AS TIMESTAMP(6))",
         f"CAST({escaped_date} AS DATE)",
     )
+
+
+def _insertion_date() -> str:
+    return date.today().isoformat()
+
+
+def _sql_columns(table_name: str, *column_names: str) -> list[str]:
+    return [table_column_sql_name(table_name, column_name) for column_name in column_names]
 
 
 def _rollback(conn) -> None:
@@ -138,11 +153,12 @@ def insert_adjustments_format(
     flag: str,
     conn,
 ):
-    start_timestamp, start_date_value = _date_values(start_date)
+    start_timestamp, start_date_value = _date_values(_insertion_date())
     return _insert_row(
         conn=conn,
-        table="DT_SDMT_UBL.RCOA_SL_WISE_ADJ",
-        columns=[
+        table=ADJUSTMENTS_TABLE,
+        columns=_sql_columns(
+            ADJUSTMENTS_TABLE,
             "SL_CODE",
             "AMOUNT",
             "FLAG",
@@ -157,7 +173,7 @@ def insert_adjustments_format(
             "PROCESS_NAME",
             "UPDATE_PROCESS_NAME",
             "ROW_HASH",
-        ],
+        ),
         values=[
             _sql_text(sl_code),
             format(amount, "f"),
@@ -189,18 +205,19 @@ def insert_rcoa_manual_data(
     particulars_definition: str,
     conn,
 ):
-    start_timestamp, start_date_value = _date_values(start_date)
+    start_timestamp, start_date_value = _date_values(_insertion_date())
     return _insert_row(
         conn=conn,
-        table="DT_SDMT_UBL.RCOA_MANUAL_DATA",
-        columns=[
+        table=MANUAL_DATA_TABLE,
+        columns=_sql_columns(
+            MANUAL_DATA_TABLE,
             "RCOA_CODE",
-            '"Domain"',
-            '"Tier"',
+            "Domain",
+            "Tier",
             "AMOUNT",
-            '"Flag"',
-            '"Particulars"',
-            '"Particulars_definition"',
+            "Flag",
+            "Particulars",
+            "Particulars_definition",
             "START_TS",
             "END_TS",
             "UPDATE_TS",
@@ -212,7 +229,7 @@ def insert_rcoa_manual_data(
             "PROCESS_NAME",
             "UPDATE_PROCESS_NAME",
             "ROW_HASH",
-        ],
+        ),
         values=[
             _sql_text(rcoa_code),
             _sql_text(domain),
@@ -244,17 +261,18 @@ def insert_tfcs_sukus(
     rcoa_code: str,
     conn,
 ):
-    if any(character.isdigit() for character in cust_name):
+    if not is_ascii_letters(cust_name):
         raise HTTPException(
-            detail="Customer name must not contain numbers.",
+            detail="Customer name must contain only letters A-Z.",
             status_code=422,
         )
 
-    start_timestamp, start_date_value = _date_values(start_date)
+    start_timestamp, start_date_value = _date_values(_insertion_date())
     return _insert_row(
         conn=conn,
-        table="DT_SDMT_UBL.RCOA_ADVANCES_MAPPING",
-        columns=[
+        table=ADVANCES_TABLE,
+        columns=_sql_columns(
+            ADVANCES_TABLE,
             "LOAN_NO",
             "CUST_NAME",
             "RCOA_CODE",
@@ -269,7 +287,7 @@ def insert_tfcs_sukus(
             "PROCESS_NAME",
             "UPDATE_PROCESS_NAME",
             "ROW_HASH",
-        ],
+        ),
         values=[
             _sql_text(loan_no),
             _sql_text(cust_name),

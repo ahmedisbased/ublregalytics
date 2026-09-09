@@ -40,6 +40,7 @@ from ..schemas import (
     TfcsSukusPageResponse,
     TfcsSukusUpdateResponse,
 )
+from ..schemas.rcoa.metadata import get_rcoa_metadata
 from ..services import update_gl_sl_mapping as update_gl_sl_mapping_service , start_reporting as start_reporting_service, view_gl_sl_mapping as view_gl_sl_mapping_service
 from ..services import end_reporting as end_reporting_service
 from ..services import view_term_deposits as view_term_deposits_service, update_term_deposits as update_term_deposits_service
@@ -64,6 +65,11 @@ BATCH_UPDATE_HANDLERS = {
     "rcoa-manual-data": (UpdateRcoaManualDataRequest, update_rcoa_manual_data_service),
     "adjustment": (UpdateAdjustmentsFormatRequest, update_adjustments_format_service),
 }
+
+
+@router.get("/rcoa-metadata")
+async def rcoa_metadata():
+    return get_rcoa_metadata()
 
 
 

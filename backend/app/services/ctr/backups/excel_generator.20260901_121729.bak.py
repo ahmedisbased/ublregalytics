@@ -799,52 +799,8 @@ def generate_ctr_csv(transaction_date, cr_dr_flag, entity_individual_flag):
         }
 
     )
-def csv_to_xml(file : File):
-    print(f"file is this : {file}")
-    df = file.to_csv()
-    print(f"csv has been created and saved as output_file.csv")
-    zip_buffer = BytesIO()
-
-    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-        
-        for split_num, start in enumerate(range(0, len(df), CHUNK_SIZE), start=1):
-
-            chunk_df = df.iloc[start:start + CHUNK_SIZE]
-            xml = build_report_header(transaction_date)
-            xml += build_reporting_person()
-            xml += build_location()
-
-            build_transaction = BUILDERS[case]
-
-            for _, row in chunk_df.iterrows():
-                xml += build_transaction(row)
-
-            xml += "</report>"
-
-            file_name = create_file_name(
-                transaction_date,
-                cr_dr_flag,
-                entity_individual_flag,
-                split_num
-            )
-
-            zip_file.writestr(file_name, xml)
 
 
-    zip_buffer.seek(0)
-
-    # before returning, save the zip file to disk for testing
-    with open(f"CTR_{transaction_date}.zip", "wb") as f:
-        f.write(zip_buffer.getvalue())
-        
-    return Response(
-        content=zip_buffer.getvalue(),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition":
-                f'attachment; filename="CTR_{transaction_date}.zip"'
-        }
-    )
 
 async def generate_ctr_xml(file : UploadFile = File(...),
     # # transaction_date: str = ''

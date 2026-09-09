@@ -1,7 +1,12 @@
 from fastapi import HTTPException
 import teradatasql
 
+from ...schemas.rcoa.metadata import table_select_list, table_search_columns
+from ...schemas.rcoa.validation import is_ascii_letters
 from .query_helpers import search_condition
+
+
+RCOA_ADVANCES_MAPPING_TABLE = "DT_SDMT_UBL.RCOA_ADVANCES_MAPPING"
 
 
 def view_tfcs_sukus_mapping_service(
@@ -17,10 +22,10 @@ def view_tfcs_sukus_mapping_service(
         end = page * limit
 
         query = f"""
-        SELECT * FROM
-        DT_SDMT_UBL.RCOA_ADVANCES_MAPPING
+        SELECT {table_select_list(RCOA_ADVANCES_MAPPING_TABLE)} FROM
+        {RCOA_ADVANCES_MAPPING_TABLE}
         WHERE START_DATE = '{date}'
-        {search_condition(search, ['LOAN_NO', 'CUST_NAME', 'RCOA_CODE'])}
+        {search_condition(search, table_search_columns(RCOA_ADVANCES_MAPPING_TABLE, ['LOAN_NO', 'CUST_NAME', 'RCOA_CODE']))}
         QUALIFY ROW_NUMBER() OVER
         (ORDER BY LOAN_NO, CUST_NAME, RCOA_CODE) BETWEEN {start} AND {end}
         """
@@ -28,9 +33,9 @@ def view_tfcs_sukus_mapping_service(
         rows = cursor.fetchall()
 
         count_query = (
-            "SELECT COUNT(*) FROM DT_SDMT_UBL.RCOA_ADVANCES_MAPPING "
+            f"SELECT COUNT(*) FROM {RCOA_ADVANCES_MAPPING_TABLE} "
             f"WHERE START_DATE = '{date}' "
-            f"{search_condition(search, ['LOAN_NO', 'CUST_NAME', 'RCOA_CODE'])}"
+            f"{search_condition(search, table_search_columns(RCOA_ADVANCES_MAPPING_TABLE, ['LOAN_NO', 'CUST_NAME', 'RCOA_CODE']))}"
         )
         cursor2 = conn.cursor()
         cursor2.execute(count_query)
@@ -69,9 +74,9 @@ def update_tfcs_sukus_mapping_service(
     rcoa_code: str | None,
     conn,
 ):
-    if cust_name is not None and any(character.isdigit() for character in cust_name):
+    if cust_name is not None and not is_ascii_letters(cust_name):
         raise HTTPException(
-            detail="Customer name must not contain numbers.",
+            detail="Customer name must contain only letters A-Z.",
             status_code=422,
         )
 
@@ -100,7 +105,7 @@ def update_tfcs_sukus_mapping_service(
     try:
         cursor = conn.cursor()
         query = f"""
-        UPDATE DT_SDMT_UBL.RCOA_ADVANCES_MAPPING
+        UPDATE {RCOA_ADVANCES_MAPPING_TABLE}
         SET {', '.join(updates)}
         WHERE LOAN_NO = '{loan_no}'
         AND START_DATE = '{start_date}'
@@ -108,7 +113,7 @@ def update_tfcs_sukus_mapping_service(
         cursor.execute(query)
 
         query = f"""
-        SELECT * FROM DT_SDMT_UBL.RCOA_ADVANCES_MAPPING
+        SELECT {table_select_list(RCOA_ADVANCES_MAPPING_TABLE)} FROM {RCOA_ADVANCES_MAPPING_TABLE}
         WHERE {' AND '.join(verification_conditions)}
         """
         cursor.execute(query)

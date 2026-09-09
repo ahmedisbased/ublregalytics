@@ -17,7 +17,7 @@ class RcoaPaginationResponse(BaseModel):
 
 
 class RcoaRowResponse(BaseModel):
-    """Base row model that keeps additional columns returned by SELECT *."""
+    """Base row model that keeps metadata-backed table columns."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -81,7 +81,6 @@ class SlRcoaMappingRowResponse(RcoaRowResponse):
     SL_CODE: Any = None
     RCOA_CODE: Any = None
     DESCRIPTION: Any = None
-    TIER: Any = None
     DOMAIN: Any = None
     START_TS: Any = None
     END_TS: Any = None

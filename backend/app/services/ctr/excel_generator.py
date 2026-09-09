@@ -552,7 +552,7 @@ def build_entity_account_block(row, prefix, direction):
     elif is_available(row.get(f"{prefix}TAX_NUM", "")):
         tax_num = identifier_text(row[f"{prefix}TAX_NUM"])
 
-    xml += tag("tax_number", tax_num)
+    xml += tag("tax_number", tax_num)       
     xml += "</t_entity>\n"
 
     for i in range(1, MAX_SIGNATORIES + 1):

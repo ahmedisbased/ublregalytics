@@ -1,7 +1,12 @@
 from fastapi import HTTPException
 import teradatasql
 
+from ...schemas.rcoa.metadata import table_search_columns, table_select_list
 from .query_helpers import search_condition
+
+
+RCOA_TD_MAPPING_TABLE = "DT_SDMT_UBL.RCOA_TD_MAPPING"
+
 
 def update_term_deposits(gl_edw_id : str, sl_code : str, cury_edw_id : str, dep_term_prd : str,
                         dep_term_type : str, start_date : str, conn):
@@ -9,7 +14,7 @@ def update_term_deposits(gl_edw_id : str, sl_code : str, cury_edw_id : str, dep_
         cursor = conn.cursor()
         query = f"""
         
-        UPDATE DT_SDMT_UBL.RCOA_TD_MAPPING 
+        UPDATE {RCOA_TD_MAPPING_TABLE}
         SET SL_CODE = '{sl_code}',
             UPDATE_DATE = CURRENT_DATE,
             UPDATE_TS = CURRENT_TIMESTAMP
@@ -23,7 +28,7 @@ def update_term_deposits(gl_edw_id : str, sl_code : str, cury_edw_id : str, dep_
         cursor.execute(query)
 
         query = f"""
-                SELECT * FROM DT_SDMT_UBL.RCOA_TD_MAPPING 
+                SELECT {table_select_list(RCOA_TD_MAPPING_TABLE)} FROM {RCOA_TD_MAPPING_TABLE}
                 WHERE SL_CODE = '{sl_code}'
                 AND GL_EDW_ID = '{gl_edw_id}'
                 AND CURY_EDW_ID = '{cury_edw_id}'
@@ -60,19 +65,19 @@ def view_term_deposits(
         cursor = conn.cursor()
         start = (page - 1) * limit + 1
         end = page * limit
-        query = f"""SELECT * FROM 
-        DT_SDMT_UBL.RCOA_TD_MAPPING
-        WHERE START_DATE = '{date}'
-        {search_condition(search, ['GL_EDW_ID', 'CURY_EDW_ID', 'SL_CODE', 'DEP_TERM_TYPE', 'DEP_TERM_PRD'])}
+        query = f"""SELECT {table_select_list(RCOA_TD_MAPPING_TABLE)} FROM
+         {RCOA_TD_MAPPING_TABLE}
+         WHERE START_DATE = '{date}'
+         {search_condition(search, table_search_columns(RCOA_TD_MAPPING_TABLE, ['GL_EDW_ID', 'CURY_EDW_ID', 'SL_CODE', 'DEP_TERM_TYPE', 'DEP_TERM_PRD']))}
         QUALIFY ROW_NUMBER() OVER(ORDER BY GL_EDW_ID, CURY_EDW_ID, DEP_TERM_PRD, DEP_TERM_TYPE) BETWEEN {start} AND {end};"""
         cursor.execute(query)
         print(query)
         rows = cursor.fetchall()       
         count_query = f"""
             SELECT COUNT(*)
-            FROM DT_SDMT_UBL.RCOA_TD_MAPPING
+            FROM {RCOA_TD_MAPPING_TABLE}
             WHERE START_DATE = '{date}'
-            {search_condition(search, ['GL_EDW_ID', 'CURY_EDW_ID', 'SL_CODE', 'DEP_TERM_TYPE', 'DEP_TERM_PRD'])}
+            {search_condition(search, table_search_columns(RCOA_TD_MAPPING_TABLE, ['GL_EDW_ID', 'CURY_EDW_ID', 'SL_CODE', 'DEP_TERM_TYPE', 'DEP_TERM_PRD']))}
         """
         cursor2 = conn.cursor()
         

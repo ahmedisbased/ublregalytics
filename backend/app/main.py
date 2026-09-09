@@ -10,6 +10,7 @@ from app.core import config
 from app.db import close_db_pool, close_str_pool
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.routes import auth_router, str_router, ctr_router, rcoa_router
+from app.services.rcoa.errors import install_rcoa_error_handling
 
 logging.basicConfig(
     filename="debug.log",
@@ -21,6 +22,8 @@ app = FastAPI(
     title="Regalytics",
     docs_url=None,
 )
+
+install_rcoa_error_handling(app)
 
 
 @app.on_event("shutdown")

@@ -3,18 +3,17 @@ from decimal import Decimal
 from fastapi import HTTPException
 import teradatasql
 
+from ...schemas.rcoa.metadata import table_column_sql_name, table_search_columns, table_select_list
 from .query_helpers import search_condition
 
 
-MANUAL_DATA_SEARCH_COLUMNS = [
-    '"Flag"',
-    'RCOA_CODE',
-    '"Domain"',
-    'AMOUNT',
-    '"Tier"',
-    '"Particulars"',
-    '"Particulars_definition"',
-]
+RCOA_MANUAL_DATA_TABLE = "DT_SDMT_UBL.RCOA_MANUAL_DATA"
+MANUAL_DATA_SEARCH_COLUMNS = table_search_columns(
+    RCOA_MANUAL_DATA_TABLE,
+    ['Flag', 'RCOA_CODE', 'Domain', 'AMOUNT', 'Tier', 'Particulars', 'Particulars_definition'],
+)
+MANUAL_DOMAIN_COLUMN = table_column_sql_name(RCOA_MANUAL_DATA_TABLE, 'Domain')
+MANUAL_TIER_COLUMN = table_column_sql_name(RCOA_MANUAL_DATA_TABLE, 'Tier')
 
 
 def view_rcoa_manual_data_service(
@@ -30,18 +29,18 @@ def view_rcoa_manual_data_service(
         end = page * limit
 
         query = f"""
-        SELECT * FROM
-        DT_SDMT_UBL.RCOA_MANUAL_DATA
+        SELECT {table_select_list(RCOA_MANUAL_DATA_TABLE)} FROM
+        {RCOA_MANUAL_DATA_TABLE}
         WHERE START_DATE = '{date}'
         {search_condition(search, MANUAL_DATA_SEARCH_COLUMNS)}
         QUALIFY ROW_NUMBER() OVER
-        (ORDER BY RCOA_CODE, "Domain", "Tier") BETWEEN {start} AND {end}
+        (ORDER BY RCOA_CODE, {MANUAL_DOMAIN_COLUMN}, {MANUAL_TIER_COLUMN}) BETWEEN {start} AND {end}
         """
         cursor.execute(query)
         rows = cursor.fetchall()
 
         count_query = (
-            "SELECT COUNT(*) FROM DT_SDMT_UBL.RCOA_MANUAL_DATA "
+            f"SELECT COUNT(*) FROM {RCOA_MANUAL_DATA_TABLE} "
             f"WHERE START_DATE = '{date}' "
             f"{search_condition(search, MANUAL_DATA_SEARCH_COLUMNS)}"
         )
@@ -96,20 +95,20 @@ def update_rcoa_manual_data_service(
     ]
 
     if original_domain is not None:
-        row_conditions.append(f'"Domain" = \'{original_domain}\'')
+        row_conditions.append(f'{MANUAL_DOMAIN_COLUMN} = \'{original_domain}\'')
     if original_tier is not None:
-        row_conditions.append(f'"Tier" = \'{original_tier}\'')
+        row_conditions.append(f'{MANUAL_TIER_COLUMN} = \'{original_tier}\'')
 
     if amount is not None:
         amount_value = format(amount, "f")
         updates.append(f"AMOUNT = {amount_value}")
         verification_conditions.append(f"AMOUNT = {amount_value}")
     if domain is not None:
-        updates.append(f'"Domain" = \'{domain}\'')
-        verification_conditions.append(f'"Domain" = \'{domain}\'')
+        updates.append(f'{MANUAL_DOMAIN_COLUMN} = \'{domain}\'')
+        verification_conditions.append(f'{MANUAL_DOMAIN_COLUMN} = \'{domain}\'')
     if tier is not None:
-        updates.append(f'"Tier" = \'{tier}\'')
-        verification_conditions.append(f'"Tier" = \'{tier}\'')
+        updates.append(f'{MANUAL_TIER_COLUMN} = \'{tier}\'')
+        verification_conditions.append(f'{MANUAL_TIER_COLUMN} = \'{tier}\'')
 
     if not updates:
         raise HTTPException(
@@ -123,14 +122,14 @@ def update_rcoa_manual_data_service(
     try:
         cursor = conn.cursor()
         query = f"""
-        UPDATE DT_SDMT_UBL.RCOA_MANUAL_DATA
+        UPDATE {RCOA_MANUAL_DATA_TABLE}
         SET {', '.join(updates)}
         WHERE {' AND '.join(row_conditions)}
         """
         cursor.execute(query)
 
         query = f"""
-        SELECT * FROM DT_SDMT_UBL.RCOA_MANUAL_DATA
+        SELECT {table_select_list(RCOA_MANUAL_DATA_TABLE)} FROM {RCOA_MANUAL_DATA_TABLE}
         WHERE {' AND '.join(verification_conditions)}
         """
         cursor.execute(query)

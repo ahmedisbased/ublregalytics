@@ -3,7 +3,11 @@ from decimal import Decimal
 from fastapi import HTTPException
 import teradatasql
 
+from ...schemas.rcoa.metadata import table_select_list, table_search_columns
 from .query_helpers import search_condition
+
+
+RCOA_SL_WISE_ADJ_TABLE = "DT_SDMT_UBL.RCOA_SL_WISE_ADJ"
 
 
 def view_adjustments_format_service(
@@ -19,10 +23,10 @@ def view_adjustments_format_service(
         end = page * limit
 
         query = f"""
-        SELECT * FROM
-        DT_SDMT_UBL.RCOA_SL_WISE_ADJ
+        SELECT {table_select_list(RCOA_SL_WISE_ADJ_TABLE)} FROM
+        {RCOA_SL_WISE_ADJ_TABLE}
         WHERE START_DATE = '{date}'
-        {search_condition(search, ['SL_CODE', 'AMOUNT', 'FLAG'])}
+        {search_condition(search, table_search_columns(RCOA_SL_WISE_ADJ_TABLE, ['SL_CODE', 'AMOUNT', 'FLAG']))}
         QUALIFY ROW_NUMBER() OVER
         (ORDER BY SL_CODE, AMOUNT, FLAG) BETWEEN {start} AND {end}
         """
@@ -30,9 +34,9 @@ def view_adjustments_format_service(
         rows = cursor.fetchall()
 
         count_query = (
-            "SELECT COUNT(*) FROM DT_SDMT_UBL.RCOA_SL_WISE_ADJ "
+            f"SELECT COUNT(*) FROM {RCOA_SL_WISE_ADJ_TABLE} "
             f"WHERE START_DATE = '{date}' "
-            f"{search_condition(search, ['SL_CODE', 'AMOUNT', 'FLAG'])}"
+            f"{search_condition(search, table_search_columns(RCOA_SL_WISE_ADJ_TABLE, ['SL_CODE', 'AMOUNT', 'FLAG']))}"
         )
         cursor2 = conn.cursor()
         cursor2.execute(count_query)
@@ -109,14 +113,14 @@ def update_adjustments_format_service(
 
         cursor = conn.cursor()
         query = f"""
-        UPDATE DT_SDMT_UBL.RCOA_SL_WISE_ADJ
+        UPDATE {RCOA_SL_WISE_ADJ_TABLE}
         SET {', '.join(updates)}
         WHERE {' AND '.join(row_conditions)}
         """
         cursor.execute(query)
 
         query = f"""
-        SELECT * FROM DT_SDMT_UBL.RCOA_SL_WISE_ADJ
+        SELECT {table_select_list(RCOA_SL_WISE_ADJ_TABLE)} FROM {RCOA_SL_WISE_ADJ_TABLE}
         WHERE {' AND '.join(verification_conditions)}
         """
         cursor.execute(query)

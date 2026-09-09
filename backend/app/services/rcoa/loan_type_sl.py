@@ -1,7 +1,12 @@
 from fastapi import HTTPException
 import teradatasql
 
+from ...schemas.rcoa.metadata import table_search_columns, table_select_list
 from .query_helpers import search_condition
+
+
+RCOA_LOAN_TYPE_MAPPING_TABLE = "DT_SDMT_UBL.RCOA_LOAN_TYPE_MAPPING"
+
 
 
 
@@ -21,10 +26,10 @@ def view_loan_type_service(
         start = (page - 1) * limit + 1
         end = page * limit
         query = f"""
-        SELECT * FROM
-        DT_SDMT_UBL.RCOA_LOAN_TYPE_MAPPING
-        WHERE START_DATE = '{date}'
-        {search_condition(search, ['SL_CODE', 'LOAN_TYPE', 'LOAN_TYPE_DESC', 'CURY_EDW_ID'])}
+        SELECT {table_select_list(RCOA_LOAN_TYPE_MAPPING_TABLE)} FROM
+         {RCOA_LOAN_TYPE_MAPPING_TABLE}
+         WHERE START_DATE = '{date}'
+         {search_condition(search, table_search_columns(RCOA_LOAN_TYPE_MAPPING_TABLE, ['SL_CODE', 'LOAN_TYPE', 'LOAN_TYPE_DESC', 'CURY_EDW_ID']))}
         QUALIFY ROW_NUMBER() OVER
 		(ORDER BY LOAN_TYPE, CURY_EDW_ID) BETWEEN {start} AND {end}"""
         cursor.execute(query)
@@ -32,9 +37,9 @@ def view_loan_type_service(
         rows = cursor.fetchall()       
         count_query = f"""
             SELECT COUNT(*)
-            FROM DT_SDMT_UBL.RCOA_LOAN_TYPE_MAPPING
+            FROM {RCOA_LOAN_TYPE_MAPPING_TABLE}
             WHERE START_DATE = '{date}'
-            {search_condition(search, ['SL_CODE', 'LOAN_TYPE', 'LOAN_TYPE_DESC', 'CURY_EDW_ID'])}
+            {search_condition(search, table_search_columns(RCOA_LOAN_TYPE_MAPPING_TABLE, ['SL_CODE', 'LOAN_TYPE', 'LOAN_TYPE_DESC', 'CURY_EDW_ID']))}
         """
         cursor2 = conn.cursor()
         
@@ -74,7 +79,7 @@ def update_loan_type_service(
     try :
         cursor = conn.cursor()
         query = f"""
-        UPDATE DT_SDMT_UBL.RCOA_LOAN_TYPE_MAPPING 
+        UPDATE {RCOA_LOAN_TYPE_MAPPING_TABLE}
         SET SL_CODE = '{sl_code}',
             UPDATE_DATE = CURRENT_DATE,
             UPDATE_TS = CURRENT_TIMESTAMP
@@ -86,7 +91,7 @@ def update_loan_type_service(
         cursor.execute(query)
 
         query = f"""
-                SELECT * FROM DT_SDMT_UBL.RCOA_LOAN_TYPE_MAPPING 
+                SELECT {table_select_list(RCOA_LOAN_TYPE_MAPPING_TABLE)} FROM {RCOA_LOAN_TYPE_MAPPING_TABLE}
                 WHERE LOAN_TYPE = '{loan_type}'
                 AND SL_CODE = '{sl_code}'
                 AND CURY_EDW_ID = '{cury_edw_id}'

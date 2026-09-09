@@ -1,7 +1,15 @@
 from fastapi import HTTPException
 import teradatasql
 
+from ...schemas.rcoa.metadata import table_search_columns, table_select_list
 from .query_helpers import search_condition
+
+
+SL_RCOA_MAPPING_TABLE = "DT_SDMT_UBL.SL_RCOA_MAPPING"
+SL_RCOA_SEARCH_COLUMNS = table_search_columns(
+    SL_RCOA_MAPPING_TABLE,
+    ['SL_CODE', 'RCOA_CODE', 'DESCRIPTION', 'DOMAIN'],
+)
 
 
 def view_sl_rcoa_mapping_service(
@@ -19,10 +27,10 @@ def view_sl_rcoa_mapping_service(
 
 
         query = f"""
-        SELECT * FROM
-        DT_SDMT_UBL.SL_RCOA_MAPPING
+        SELECT {table_select_list(SL_RCOA_MAPPING_TABLE)} FROM
+        {SL_RCOA_MAPPING_TABLE}
         WHERE START_DATE = '{date}'
-        {search_condition(search, ['SL_CODE', 'RCOA_CODE', 'DESCRIPTION', 'TIER', 'DOMAIN'])}
+         {search_condition(search, SL_RCOA_SEARCH_COLUMNS)}
         QUALIFY ROW_NUMBER() OVER
 		(ORDER BY SL_CODE, RCOA_CODE) BETWEEN {start} AND {end}"""
         cursor.execute(query)
@@ -30,9 +38,9 @@ def view_sl_rcoa_mapping_service(
         rows = cursor.fetchall()       
         count_query = f"""
             SELECT COUNT(*)
-            FROM DT_SDMT_UBL.SL_RCOA_MAPPING
+            FROM {SL_RCOA_MAPPING_TABLE}
             WHERE START_DATE = '{date}'
-            {search_condition(search, ['SL_CODE', 'RCOA_CODE', 'DESCRIPTION', 'TIER', 'DOMAIN'])}
+            {search_condition(search, SL_RCOA_SEARCH_COLUMNS)}
         """
         cursor2 = conn.cursor()
         
@@ -104,14 +112,14 @@ def update_sl_rcoa_mapping_service(
     try:
         cursor = conn.cursor()
         query = f"""
-        UPDATE DT_SDMT_UBL.SL_RCOA_MAPPING
+        UPDATE {SL_RCOA_MAPPING_TABLE}
         SET {', '.join(updates)}
         WHERE {' AND '.join(row_conditions)}
         """
         cursor.execute(query)
 
         query = f"""
-        SELECT * FROM DT_SDMT_UBL.SL_RCOA_MAPPING
+        SELECT {table_select_list(SL_RCOA_MAPPING_TABLE)} FROM {SL_RCOA_MAPPING_TABLE}
         WHERE {' AND '.join(verification_conditions)}
         """
         cursor.execute(query)

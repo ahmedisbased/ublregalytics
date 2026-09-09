@@ -22,6 +22,25 @@ export interface RcoaPageResponse {
     pagination: RcoaPagination;
 }
 
+export interface RcoaTableColumnMetadata {
+    name: string;
+    sql_name: string;
+    type: string;
+    nullable: boolean;
+    max_length: string;
+    decimal_total_digits: string;
+    decimal_fractional_digits: string;
+}
+
+export interface RcoaTableMetadata {
+    columns: RcoaTableColumnMetadata[];
+}
+
+export interface RcoaMetadataResponse {
+    source: string;
+    tables: Record<string, RcoaTableMetadata>;
+}
+
 export interface RcoaBatchChange {
     mode: RcoaMode;
     change: Record<string, unknown>;
@@ -83,6 +102,11 @@ export const fetchRcoaPage = async (
             ? normalizedSearch
             : undefined,
     });
+    return data;
+};
+
+export const fetchRcoaMetadata = async () => {
+    const { data } = await api.get<RcoaMetadataResponse>('/rcoa-metadata');
     return data;
 };
 

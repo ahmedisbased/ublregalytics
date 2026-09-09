@@ -68,6 +68,23 @@
   flex-shrink: 0;
 }
 
+.rcoa-reporting-action {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 12rem;
+}
+
+.rcoa-action-hint {
+  color: #9bb3c1;
+  font-size: 0.64rem;
+  line-height: 1.25;
+  text-align: center;
+}
+
+.rcoa-end-action .rcoa-action-hint {
+  color: #8a6b66;
+}
+
 .rcoa-date-summary {
   display: grid;
   gap: 0.25rem;
@@ -113,6 +130,30 @@
 .rcoa-status-dot.is-live {
   background: #18a77a;
   box-shadow: 0 0 0 4px rgba(24, 167, 122, 0.12);
+}
+
+.rcoa-status-dot.is-in_progress {
+  background: #18a77a;
+  box-shadow: 0 0 0 4px rgba(24, 167, 122, 0.12);
+}
+
+.rcoa-status-dot.is-ending {
+  background: #d8873f;
+  box-shadow: 0 0 0 4px rgba(216, 135, 63, 0.14);
+}
+
+.rcoa-status-dot.is-completed {
+  background: #3478a4;
+  box-shadow: 0 0 0 4px rgba(52, 120, 164, 0.13);
+}
+
+.rcoa-status-dot.is-failed {
+  background: #b14d38;
+  box-shadow: 0 0 0 4px rgba(177, 77, 56, 0.13);
+}
+
+.rcoa-status-description {
+  color: #728594;
 }
 
 .rcoa-status-divider {
@@ -329,6 +370,14 @@
   color: #17344a;
   font: inherit;
   font-size: 0.8rem;
+}
+
+.rcoa-search-hint {
+  display: block;
+  margin-top: 0.3rem;
+  color: #8295a1;
+  font-size: 0.63rem;
+  font-weight: 500;
 }
 
 .rcoa-filter-actions,
@@ -668,6 +717,10 @@
   border-radius: 0.55rem 0.55rem 1.2rem 1.2rem;
 }
 
+.rcoa-cycle-end .rcoa-reporting-action {
+  min-width: 15rem;
+}
+
 .rcoa-end-button {
   border: 1px solid #a94136;
   background: #a94136;
@@ -726,6 +779,45 @@
 .rcoa-modal-copy strong {
   color: #17344a;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.rcoa-confirmation-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.55rem;
+  margin: 1rem 0;
+}
+
+.rcoa-confirmation-summary div {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  border: 1px solid #dce4ec;
+  border-radius: 0.45rem;
+  background: #f7fafc;
+}
+
+.rcoa-confirmation-summary span {
+  color: #718391;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.rcoa-confirmation-summary strong {
+  color: #17344a;
+  font-size: 0.82rem;
+}
+
+.rcoa-confirmation-warning {
+  margin: 0;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid #efcf9d;
+  border-radius: 0.45rem;
+  background: #fff8eb;
+  color: #8a5b25;
+  font-size: 0.76rem;
+  line-height: 1.45;
 }
 
 .rcoa-edit-grid {
@@ -797,12 +889,22 @@
     justify-content: space-between;
   }
 
+  .rcoa-reporting-action,
+  .rcoa-cycle-end .rcoa-reporting-action {
+    width: 100%;
+    min-width: 0;
+  }
+
   .rcoa-date-summary {
     text-align: left;
   }
 
-.rcoa-status-divider {
+  .rcoa-status-divider {
     display: none;
+  }
+
+  .rcoa-confirmation-summary {
+    grid-template-columns: 1fr;
   }
 
   .rcoa-workspace-card {
