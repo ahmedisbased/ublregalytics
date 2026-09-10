@@ -18,8 +18,7 @@ from lxml import etree
 import copy, os
 import logging
 from typing import Any
-# from .fetch_data import fetch_data
-from .fetch_data_working import fetch_data
+from .fetch_data import fetch_data
 from .errors import NoRecordsFound, StrGenerationError, StrProcessingError, StrTeradataError
 from .observability import add_str_log, exception_text, mask_account
 

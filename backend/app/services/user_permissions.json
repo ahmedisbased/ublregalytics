@@ -40,11 +40,16 @@
 "asif.mehmoud":{
     "permissions" : ["STR","CTR"]
 },
+"933778":{
+    "permissions" : ["STR","CTR"]
+},
 
 "syed.tahir1":{
     "permissions" : ["STR", "CTR"]
 },
-
+"942463":{
+    "permissions" : ["STR", "CTR"]
+},
 "hunain.raza":{
     "permissions" : ["STR"]
 },
@@ -64,22 +69,55 @@
 "bilal.muhammed":{
     "permissions" : ["CTR"]
 },
+"905807":{
+    "permissions" : ["CTR"]
+},
 
 "wasey.khan":{
+    "permissions" : ["CTR"]
+},
+"927671":{
     "permissions" : ["CTR"]
 },
 "muneeb.salem":{
     "permissions" : ["CTR"]
 },
+"936110":{
+    "permissions" : ["CTR"]
+},
 "nor.fatima":{
     "permissions" : ["CTR"]
 },
+"920290":{
+    "permissions" : ["CTR"]
+},
 
+"adnan.dawood":{
+    "permissions" : ["RCOA"]
+},
+"602042":{
+    "permissions" : ["RCOA"]
+},
+"muhammad.mushtaq":{
+    "permissions" : ["RCOA"]
+},
+"641441":{
+    "permissions" : ["RCOA"]
+},
+"sibbat.naqvi":{
+    "permissions" : ["RCOA"]
+},
+"908013":{
+    "permissions" : ["RCOA"]
+},
 "ahmed.rana":{
     "permissions" : ["STR","CTR","RCOA"]
 },
 
 "simran.kumari":{
+    "permissions" : ["STR", "CTR"]
+},
+"932413":{
     "permissions" : ["STR", "CTR"]
 }
 }

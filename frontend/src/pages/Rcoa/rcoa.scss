@@ -309,7 +309,8 @@
 .rcoa-date-filter input,
 .rcoa-action-filter select,
 .rcoa-search-input,
-.rcoa-field input {
+.rcoa-field input,
+.rcoa-field textarea {
   min-height: 2.2rem;
   border: 1px solid #cfdbe4;
   border-radius: 0.4rem;
@@ -334,12 +335,14 @@
 .rcoa-date-filter input:focus,
 .rcoa-action-filter select:focus,
 .rcoa-search-input:focus-within,
-.rcoa-field input:focus {
+.rcoa-field input:focus,
+.rcoa-field textarea:focus {
   border-color: #6bb9d5;
   box-shadow: 0 0 0 3px rgba(107, 185, 213, 0.16);
 }
 
-.rcoa-field input:disabled {
+.rcoa-field input:disabled,
+.rcoa-field textarea:disabled {
   cursor: wait;
   background: #f5f8fa;
   color: #718391;
@@ -617,6 +620,39 @@
 .rcoa-inline-input:focus {
   border-color: #0a597d;
   box-shadow: 0 0 0 3px rgba(10, 89, 125, 0.16);
+}
+
+.rcoa-auto-textarea {
+  width: 100%;
+  min-height: 2.2rem;
+  max-height: 20rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid #cfdbe4;
+  border-radius: 0.4rem;
+  background: #fff;
+  color: #17344a;
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  outline: 0;
+  overflow-y: auto;
+  resize: vertical;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.rcoa-auto-textarea:focus {
+  border-color: #0a597d;
+  box-shadow: 0 0 0 3px rgba(10, 89, 125, 0.16);
+}
+
+.rcoa-inline-textarea {
+  min-width: 12rem;
+  min-height: 2rem;
+  padding: 0.35rem 0.5rem;
+  border-color: #6bb9d5;
+  border-radius: 0.35rem;
+  font-size: 0.78rem;
+  box-shadow: 0 0 0 3px rgba(107, 185, 213, 0.12);
 }
 
 .rcoa-number .rcoa-inline-input {

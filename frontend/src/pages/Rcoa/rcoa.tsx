@@ -1,4 +1,12 @@
-import { useEffect, useState, type KeyboardEvent, type ReactNode } from 'react';
+import {
+    useEffect,
+    useLayoutEffect,
+    useRef,
+    useState,
+    type ChangeEvent,
+    type KeyboardEvent,
+    type ReactNode,
+} from 'react';
 import {
     FaBalanceScale,
     FaCheckCircle,
@@ -179,6 +187,52 @@ const normalizeCustomerName = (value: string) => value.replace(/[^A-Za-z]/g, '')
 const isValidCustomerName = (value: string) => CUSTOMER_NAME_PATTERN.test(value);
 
 const getEditorInputType = (field: EditorField) => field.type === 'number' ? 'text' : field.type ?? 'text';
+
+const EXPANDABLE_TEXT_FIELDS = new Set(['description', 'particulars', 'particulars_definition']);
+const isExpandableTextField = (field: EditorField) => (
+    field.type !== 'number' && EXPANDABLE_TEXT_FIELDS.has(field.key)
+);
+
+type AutoGrowingTextareaProps = {
+    className?: string;
+    value: string;
+    ariaLabel?: string;
+    disabled?: boolean;
+    onChange: (event: ChangeEvent<HTMLTextAreaElement>) => void;
+    onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
+};
+
+const AutoGrowingTextarea = ({
+    className,
+    value,
+    ariaLabel,
+    disabled,
+    onChange,
+    onKeyDown,
+}: AutoGrowingTextareaProps) => {
+    const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+    useLayoutEffect(() => {
+        const textarea = textareaRef.current;
+        if (!textarea) return;
+
+        textarea.style.height = 'auto';
+        textarea.style.height = `${Math.min(textarea.scrollHeight, 320)}px`;
+    }, [value]);
+
+    return (
+        <textarea
+            ref={textareaRef}
+            className={className}
+            rows={1}
+            value={value}
+            aria-label={ariaLabel}
+            disabled={disabled}
+            onChange={onChange}
+            onKeyDown={onKeyDown}
+        />
+    );
+};
 
 const getDraftForFields = (row: RcoaRow, fields: EditorField[]) => fields.reduce<Record<string, string>>(
     (draft, field) => {
@@ -1042,8 +1096,8 @@ const Rcoa = () => {
         });
     };
 
-    const handleEditorKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-        if (event.key === 'Enter') {
+    const handleEditorKeyDown = (event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+        if (event.key === 'Enter' && event.currentTarget.tagName !== 'TEXTAREA') {
             event.preventDefault();
             handleStageChanges();
         }
@@ -1171,8 +1225,8 @@ const Rcoa = () => {
         }
     };
 
-    const handleInsertKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-        if (event.key === 'Enter') {
+    const handleInsertKeyDown = (event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+        if (event.key === 'Enter' && event.currentTarget.tagName !== 'TEXTAREA') {
             event.preventDefault();
             void handleInsert();
         }
@@ -1192,13 +1246,22 @@ const Rcoa = () => {
         let content: ReactNode = displayValue(value);
 
         if (isEditing && editorField) {
-            content = (
+            const editorValue = draft[editorField.key] ?? value;
+            content = isExpandableTextField(editorField) ? (
+                <AutoGrowingTextarea
+                    className="rcoa-auto-textarea rcoa-inline-textarea"
+                    value={editorValue}
+                    ariaLabel={`Edit ${column.label}`}
+                    onChange={(event) => updateEditorDraft(editorField, event.target.value)}
+                    onKeyDown={handleEditorKeyDown}
+                />
+            ) : (
                 <input
                     className="rcoa-inline-input"
                     type={getEditorInputType(editorField)}
                     inputMode={editorField.type === 'number' ? editorField.step === '1' ? 'numeric' : 'decimal' : undefined}
                     step={editorField.step}
-                    value={draft[editorField.key] ?? value}
+                    value={editorValue}
                     aria-label={`Edit ${column.label}`}
                     pattern={isCustomerNameField(editorField) ? CUSTOMER_NAME_INPUT_PATTERN : undefined}
                     title={isCustomerNameField(editorField) ? CUSTOMER_NAME_ERROR : undefined}
@@ -1224,38 +1287,65 @@ const Rcoa = () => {
         );
     };
 
-    const renderEditorFields = () => definition.fields.map((field) => (
-        <label className="rcoa-field" key={field.key}>
-            <span>{field.label}</span>
-            <input
-                type={getEditorInputType(field)}
-                inputMode={field.type === 'number' ? field.step === '1' ? 'numeric' : 'decimal' : undefined}
-                step={field.step}
-                value={draft[field.key] ?? ''}
-                pattern={isCustomerNameField(field) ? CUSTOMER_NAME_INPUT_PATTERN : undefined}
-                title={isCustomerNameField(field) ? CUSTOMER_NAME_ERROR : undefined}
-                onChange={(event) => updateEditorDraft(field, event.target.value)}
-                onKeyDown={handleEditorKeyDown}
-            />
-        </label>
-    ));
+    const renderEditorFields = () => definition.fields.map((field) => {
+        const value = draft[field.key] ?? '';
+        return (
+            <label className="rcoa-field" key={field.key}>
+                <span>{field.label}</span>
+                {isExpandableTextField(field) ? (
+                    <AutoGrowingTextarea
+                        className="rcoa-auto-textarea"
+                        value={value}
+                        ariaLabel={field.label}
+                        onChange={(event) => updateEditorDraft(field, event.target.value)}
+                        onKeyDown={handleEditorKeyDown}
+                    />
+                ) : (
+                    <input
+                        type={getEditorInputType(field)}
+                        inputMode={field.type === 'number' ? field.step === '1' ? 'numeric' : 'decimal' : undefined}
+                        step={field.step}
+                        value={value}
+                        pattern={isCustomerNameField(field) ? CUSTOMER_NAME_INPUT_PATTERN : undefined}
+                        title={isCustomerNameField(field) ? CUSTOMER_NAME_ERROR : undefined}
+                        onChange={(event) => updateEditorDraft(field, event.target.value)}
+                        onKeyDown={handleEditorKeyDown}
+                    />
+                )}
+            </label>
+        );
+    });
 
-    const renderInsertFields = () => definition.insertFields?.map((field) => (
-        <label className="rcoa-field" key={field.key}>
-            <span>{field.label}</span>
-            <input
-                type={getEditorInputType(field)}
-                inputMode={field.type === 'number' ? field.step === '1' ? 'numeric' : 'decimal' : undefined}
-                step={field.step}
-                value={insertDraft[field.key] ?? ''}
-                disabled={isInsertSaving}
-                pattern={isCustomerNameField(field) ? CUSTOMER_NAME_INPUT_PATTERN : undefined}
-                title={isCustomerNameField(field) ? CUSTOMER_NAME_ERROR : undefined}
-                onChange={(event) => updateInsertDraft(field, event.target.value)}
-                onKeyDown={handleInsertKeyDown}
-            />
-        </label>
-    ));
+    const renderInsertFields = () => definition.insertFields?.map((field) => {
+        const value = insertDraft[field.key] ?? '';
+        return (
+            <label className="rcoa-field" key={field.key}>
+                <span>{field.label}</span>
+                {isExpandableTextField(field) ? (
+                    <AutoGrowingTextarea
+                        className="rcoa-auto-textarea"
+                        value={value}
+                        ariaLabel={field.label}
+                        disabled={isInsertSaving}
+                        onChange={(event) => updateInsertDraft(field, event.target.value)}
+                        onKeyDown={handleInsertKeyDown}
+                    />
+                ) : (
+                    <input
+                        type={getEditorInputType(field)}
+                        inputMode={field.type === 'number' ? field.step === '1' ? 'numeric' : 'decimal' : undefined}
+                        step={field.step}
+                        value={value}
+                        disabled={isInsertSaving}
+                        pattern={isCustomerNameField(field) ? CUSTOMER_NAME_INPUT_PATTERN : undefined}
+                        title={isCustomerNameField(field) ? CUSTOMER_NAME_ERROR : undefined}
+                        onChange={(event) => updateInsertDraft(field, event.target.value)}
+                        onKeyDown={handleInsertKeyDown}
+                    />
+                )}
+            </label>
+        );
+    });
 
     const renderRowAction = (row: RcoaRow, pending: PendingChange | undefined, isEditing: boolean) => (
         isEditing ? (
